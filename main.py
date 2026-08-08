@@ -14,6 +14,7 @@ Fluxo:
 """
 import os
 import io
+import re
 import json
 import glob
 import base64
@@ -110,11 +111,35 @@ def find_estimate(num):
     return results[0]
 
 
+GUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def achar_guids(obj, prefixo="", nivel=0):
+    """Varre a estimate e devolve todo campo cujo valor tem cara de GUID."""
+    achados = {}
+    if nivel > 2:
+        return achados
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            cam = (prefixo + "." + str(k)) if prefixo else str(k)
+            if isinstance(v, str) and GUID_RE.match(v.strip()):
+                achados[cam] = v.strip()
+            elif isinstance(v, (dict, list)):
+                achados.update(achar_guids(v, cam, nivel + 1))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj[:8]):
+            achados.update(achar_guids(v, prefixo + "[" + str(i) + "]",
+                                       nivel + 1))
+    return achados
+
+
 def jn_link(est):
     """Monta o endereço da estimate no site do JobNimbus."""
     job = next((r for r in (est.get("related") or [])
                 if r.get("type") == "job"), None)
-    guid = str(est.get("guid") or "").strip()
+    guid = str(est.get("guid") or est.get("jnid") or "").strip().lower()
     jobid = str((job or {}).get("id") or "").strip()
     if jobid and guid:
         return ("https://app.jobnimbus.com/job/" + jobid +
@@ -388,7 +413,9 @@ def link(req: Req, authorization: str = Header(default="")):
     contato = next((r for r in (est.get("related") or [])
                     if r.get("type") == "contact"), None)
     return {"ok": True, "num": req.num, "jn_url": jn_link(est),
-            "cliente": (contato or {}).get("name", "")}
+            "cliente": (contato or {}).get("name", ""),
+            "guids": achar_guids(est),
+            "chaves": sorted(est.keys())[:60]}
 
 
 @app.post("/gerar")
