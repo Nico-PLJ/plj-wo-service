@@ -146,6 +146,16 @@ REGRAS DE CONTEÚDO:
 - "atencao": no MÁXIMO 4 itens, só o que causa retrabalho, erro caro ou atraso
   (divergência de marca/medida, esperar permit, material que ainda não chegou).
   Se não tiver nada de verdade, devolva lista vazia.
+
+O CABEÇALHO — só estes campos, nada mais:
+- "endereco": endereço do imóvel, copiado do PDF. Se não achar, devolva "".
+- "vendedor": nome do vendedor/sales rep, copiado do PDF. Se não achar, devolva "".
+- "servicos": lista curta com os TIPOS de serviço, 2 a 5 palavras cada.
+  Ex.: ["Troca de 6 janelas", "Trim de PVC"]. Só o tipo, sem detalhe nem medida.
+- NÃO INVENTE NADA. Se a informação não está no PDF, devolva "" ou lista vazia.
+  Não deduza, não estime, não complete com o que "provavelmente" é.
+- NÃO coloque no cabeçalho: forma de pagamento, valores, datas, número do contrato,
+  especificação técnica completa, nem repetir o nome do cliente.
 - DESCARTE (manter=false) fotos que sejam logo, capa, certificado de seguro,
   certificação de fabricante, tabela de preços, assinatura ou página só de texto.
   Fique só com fotos reais do imóvel.
@@ -160,7 +170,9 @@ EXEMPLOS DO TOM CERTO:
 Responda SOMENTE com um objeto JSON válido, sem markdown, sem crases, no formato:
 {
   "titulo": "TRIM E JANELAS",
-  "info_extra": [["MATERIAL", "Janela Mathews Brothers · PVC branco"]],
+  "endereco": "19 Janet Street, Plymouth, MA 02360",
+  "vendedor": "Rob Silva",
+  "servicos": ["Troca de 6 janelas", "Trim de PVC"],
   "partes": [
     {"titulo": "PARTE A — TRIM DE PVC",
      "nota": "Trocar só o que está marcado em vermelho.",
@@ -227,8 +239,7 @@ def _linha_amarela():
                       spaceBefore=3, spaceAfter=8)
 
 
-def build_pdf(out_path, wo, cliente, endereco, data, contrato,
-              info_extra, photos):
+def build_pdf(out_path, wo, cliente, endereco, vendedor, servicos, photos):
     doc = SimpleDocTemplate(out_path, pagesize=letter,
                             leftMargin=0.8 * inch, rightMargin=0.8 * inch,
                             topMargin=0.7 * inch, bottomMargin=0.7 * inch,
@@ -239,11 +250,11 @@ def build_pdf(out_path, wo, cliente, endereco, data, contrato,
     F.append(Paragraph("PLJ CARPENTRY &amp; REMODELING", S_SUB))
     F.append(_linha_amarela())
 
+    if isinstance(servicos, (list, tuple)):
+        servicos = " · ".join(str(s) for s in servicos if s)
     linhas = [["CLIENTE", cliente], ["ENDEREÇO", endereco],
-              ["DATA", data or ""], ["CONTRATO", contrato or "—"]]
-    for row in (info_extra or []):
-        if isinstance(row, (list, tuple)) and len(row) >= 2:
-            linhas.append([str(row[0]), " · ".join(str(x) for x in row[1:])])
+              ["VENDEDOR", vendedor], ["SERVIÇOS", servicos]]
+    linhas = [[k, v] for k, v in linhas if str(v or "").strip()]
     dados = [[Paragraph(_esc(k), S_CELLB), Paragraph(_esc(v), S_CELL)]
              for k, v in linhas]
     t = Table(dados, colWidths=[1.35 * inch, 5.55 * inch])
@@ -368,8 +379,10 @@ def gerar(req: Req, authorization: str = Header(default="")):
     contato = next((r for r in (est.get("related") or [])
                     if r.get("type") == "contact"), None)
     cliente = contato.get("name", "") if contato else ""
-    endereco = " ".join(str(est.get(k, "") or "") for k in
-                        ("address_line1", "city", "state_text", "zip")).strip()
+    partes_end = [str(est.get(k, "") or "").strip() for k in
+                  ("address_line1", "city", "state_text", "zip")]
+    endereco = " ".join(p for p in partes_end if p).strip()
+    vendedor = str(est.get("sales_rep_name", "") or "").strip()
     pdf_bytes = download_pdf(att)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -389,9 +402,10 @@ def gerar(req: Req, authorization: str = Header(default="")):
                 wo_photos.append((p, d.get("titulo", ""), d.get("descricao", "")))
 
         out = os.path.join(tmp, "out.pdf")
-        extra = analise.get("info_extra")
-        build_pdf(out, analise, cliente, endereco, "", "—",
-                  extra if isinstance(extra, list) else [], wo_photos)
+        end_final = endereco or str(analise.get("endereco", "") or "").strip()
+        vend_final = vendedor or str(analise.get("vendedor", "") or "").strip()
+        build_pdf(out, analise, cliente, end_final, vend_final,
+                  analise.get("servicos") or "", wo_photos)
         url = upload_pdf(out, req.num)
 
     return {"ok": True, "cliente": cliente, "url": url,
