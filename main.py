@@ -139,7 +139,7 @@ def jn_link(est):
     """Monta o endereço da estimate no site do JobNimbus."""
     job = next((r for r in (est.get("related") or [])
                 if r.get("type") == "job"), None)
-    guid = str(est.get("guid") or est.get("jnid") or "").strip().lower()
+    guid = str(est.get("jnid") or est.get("guid") or "").strip().lower()
     jobid = str((job or {}).get("id") or "").strip()
     if jobid and guid:
         return ("https://app.jobnimbus.com/job/" + jobid +
@@ -415,7 +415,9 @@ def link(req: Req, authorization: str = Header(default="")):
     return {"ok": True, "num": req.num, "jn_url": jn_link(est),
             "cliente": (contato or {}).get("name", ""),
             "guids": achar_guids(est),
-            "chaves": sorted(est.keys())[:60]}
+            "related": [{"tipo": r.get("type"), "id": r.get("id"),
+                         "nome": r.get("name")}
+                        for r in (est.get("related") or [])]}
 
 
 @app.post("/gerar")
