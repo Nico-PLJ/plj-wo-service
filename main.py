@@ -14,7 +14,6 @@ Fluxo:
 """
 import os
 import io
-import re
 import json
 import glob
 import base64
@@ -111,40 +110,57 @@ def find_estimate(num):
     return results[0]
 
 
-GUID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+def jn_contato(est):
+    """Busca o contato ligado à estimate — é onde mora o endereço bom."""
+    c = next((r for r in (est.get("related") or [])
+              if r.get("type") == "contact"), None)
+    if not c or not c.get("id"):
+        return {}
+    try:
+        r = requests.get(f"{JN_BASE}/contacts/{c['id']}",
+                         headers=jn_headers(), timeout=60)
+        return r.json() if r.ok else {}
+    except Exception:
+        return {}
 
 
-def achar_guids(obj, prefixo="", nivel=0):
-    """Varre a estimate e devolve todo campo cujo valor tem cara de GUID."""
-    achados = {}
-    if nivel > 2:
-        return achados
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            cam = (prefixo + "." + str(k)) if prefixo else str(k)
-            if isinstance(v, str) and GUID_RE.match(v.strip()):
-                achados[cam] = v.strip()
-            elif isinstance(v, (dict, list)):
-                achados.update(achar_guids(v, cam, nivel + 1))
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj[:8]):
-            achados.update(achar_guids(v, prefixo + "[" + str(i) + "]",
-                                       nivel + 1))
-    return achados
+def dados_cliente(est):
+    """Nome e endereço em partes, com a estimate como reserva."""
+    ct = jn_contato(est)
+    rel = next((r for r in (est.get("related") or [])
+                if r.get("type") == "contact"), None)
+    nome = (ct.get("display_name") or ct.get("name")
+            or (rel or {}).get("name") or "").strip()
+    def pega(k):
+        return str(ct.get(k) or est.get(k) or "").strip()
+    rua = " ".join(x for x in [pega("address_line1"),
+                               pega("address_line2")] if x).strip()
+    cid = pega("city")
+    est_uf = pega("state_text")
+    cep = pega("zip")
+    completo = ", ".join(x for x in
+                         [rua, cid, " ".join(y for y in [est_uf, cep] if y)]
+                         if x)
+    return {"cliente": nome, "rua": rua, "cidade": cid,
+            "estado": est_uf, "cep": cep, "endereco": completo}
 
 
 def jn_link(est):
-    """Monta o endereço da estimate no site do JobNimbus."""
-    job = next((r for r in (est.get("related") or [])
-                if r.get("type") == "job"), None)
-    guid = str(est.get("jnid") or est.get("guid") or "").strip().lower()
+    """Monta o endereço da estimate no site do JobNimbus.
+
+    O site localiza a estimate pelo jnid; o trecho do job é ignorado,
+    então serve qualquer id relacionado (usamos o do job quando existe).
+    """
+    est_id = str(est.get("jnid") or est.get("guid") or "").strip().lower()
+    if not est_id:
+        return ""
+    rel = est.get("related") or []
+    job = next((r for r in rel if r.get("type") == "job"), None)
     jobid = str((job or {}).get("id") or "").strip()
-    if jobid and guid:
-        return ("https://app.jobnimbus.com/job/" + jobid +
-                "/estimates/" + guid + "/view")
-    return ""
+    if not jobid:
+        jobid = str((rel[0] if rel else {}).get("id") or "").strip() or "0"
+    return ("https://app.jobnimbus.com/job/" + jobid +
+            "/estimates/" + est_id + "/view")
 
 
 def download_pdf(attachment_id):
@@ -410,14 +426,11 @@ def link(req: Req, authorization: str = Header(default="")):
     """Só devolve o endereço da estimate no JobNimbus. Rápido, sem gerar PDF."""
     check_admin(authorization)
     est = find_estimate(req.num)
-    contato = next((r for r in (est.get("related") or [])
-                    if r.get("type") == "contact"), None)
+    d = dados_cliente(est)
     return {"ok": True, "num": req.num, "jn_url": jn_link(est),
-            "cliente": (contato or {}).get("name", ""),
-            "guids": achar_guids(est),
-            "related": [{"tipo": r.get("type"), "id": r.get("id"),
-                         "nome": r.get("name")}
-                        for r in (est.get("related") or [])]}
+            "cliente": d["cliente"], "rua": d["rua"], "cidade": d["cidade"],
+            "estado": d["estado"], "cep": d["cep"], "endereco": d["endereco"],
+            "total": est.get("total"), "vendedor": est.get("sales_rep_name", "")}
 
 
 @app.post("/gerar")
@@ -428,12 +441,9 @@ def gerar(req: Req, authorization: str = Header(default="")):
     if not att:
         raise HTTPException(404, "Estimate sem PDF anexo.")
 
-    contato = next((r for r in (est.get("related") or [])
-                    if r.get("type") == "contact"), None)
-    cliente = contato.get("name", "") if contato else ""
-    partes_end = [str(est.get(k, "") or "").strip() for k in
-                  ("address_line1", "city", "state_text", "zip")]
-    endereco = " ".join(p for p in partes_end if p).strip()
+    d = dados_cliente(est)
+    cliente = d["cliente"]
+    endereco = d["endereco"]
     vendedor = str(est.get("sales_rep_name", "") or "").strip()
     pdf_bytes = download_pdf(att)
 
