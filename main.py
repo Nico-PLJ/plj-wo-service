@@ -110,6 +110,18 @@ def find_estimate(num):
     return results[0]
 
 
+def jn_link(est):
+    """Monta o endereço da estimate no site do JobNimbus."""
+    job = next((r for r in (est.get("related") or [])
+                if r.get("type") == "job"), None)
+    guid = str(est.get("guid") or "").strip()
+    jobid = str((job or {}).get("id") or "").strip()
+    if jobid and guid:
+        return ("https://app.jobnimbus.com/job/" + jobid +
+                "/estimates/" + guid + "/view")
+    return ""
+
+
 def download_pdf(attachment_id):
     r = requests.get(f"{JN_BASE}/files/{attachment_id}",
                      headers=jn_headers(), timeout=180)
@@ -368,6 +380,17 @@ def health():
     return {"ok": True, "service": "PLJ Work Order generator"}
 
 
+@app.post("/link")
+def link(req: Req, authorization: str = Header(default="")):
+    """Só devolve o endereço da estimate no JobNimbus. Rápido, sem gerar PDF."""
+    check_admin(authorization)
+    est = find_estimate(req.num)
+    contato = next((r for r in (est.get("related") or [])
+                    if r.get("type") == "contact"), None)
+    return {"ok": True, "num": req.num, "jn_url": jn_link(est),
+            "cliente": (contato or {}).get("name", "")}
+
+
 @app.post("/gerar")
 def gerar(req: Req, authorization: str = Header(default="")):
     check_admin(authorization)
@@ -409,6 +432,7 @@ def gerar(req: Req, authorization: str = Header(default="")):
         url = upload_pdf(out, req.num)
 
     return {"ok": True, "cliente": cliente, "url": url,
+            "jn_url": jn_link(est),
             "titulo": analise.get("titulo", ""),
             "fotos_incluidas": len(wo_photos),
             "fotos_extraidas": len(fotos)}
