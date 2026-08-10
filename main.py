@@ -475,3 +475,271 @@ def gerar(req: Req, authorization: str = Header(default="")):
             "titulo": analise.get("titulo", ""),
             "fotos_incluidas": len(wo_photos),
             "fotos_extraidas": len(fotos)}
+
+
+# =====================================================================
+# QUICKBOOKS — OAuth, tokens e financeiro por projeto
+# =====================================================================
+import re as _re
+import secrets as _secrets
+from datetime import date as _date
+from fastapi.responses import RedirectResponse, HTMLResponse
+
+QB_ID = os.environ.get("QB_CLIENT_ID", "")
+QB_SECRET = os.environ.get("QB_CLIENT_SECRET", "")
+SERVICE_URL = os.environ.get("SERVICE_URL", "").rstrip("/")
+QB_REDIRECT = SERVICE_URL + "/qb/callback"
+QB_AUTH = "https://appcenter.intuit.com/connect/oauth2"
+QB_TOKEN = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+QB_API = "https://quickbooks.api.intuit.com/v3/company"
+QB_MINOR = "75"
+_qb_estado = {}
+
+
+# ---------------------------------------------------------- tokens
+def qb_sb_headers():
+    return {"Authorization": "Bearer " + SUPABASE_SERVICE_KEY,
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Content-Type": "application/json"}
+
+
+def qb_ler():
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/qb_tokens",
+                     params={"id": "eq.1", "select": "*"},
+                     headers=qb_sb_headers(), timeout=30)
+    linhas = r.json() if r.ok else []
+    return linhas[0] if linhas else None
+
+
+def qb_gravar(realm, refresh):
+    requests.post(f"{SUPABASE_URL}/rest/v1/qb_tokens",
+                  headers={**qb_sb_headers(), "Prefer": "resolution=merge-duplicates"},
+                  json={"id": 1, "realm_id": realm, "refresh_token": refresh},
+                  timeout=30)
+
+
+def qb_token(codigo=None, refresh=None):
+    dados = ({"grant_type": "authorization_code", "code": codigo,
+              "redirect_uri": QB_REDIRECT} if codigo else
+             {"grant_type": "refresh_token", "refresh_token": refresh})
+    r = requests.post(QB_TOKEN, data=dados,
+                      auth=(QB_ID, QB_SECRET),
+                      headers={"Accept": "application/json"}, timeout=60)
+    if not r.ok:
+        raise HTTPException(502, f"QuickBooks recusou o token: {r.text[:200]}")
+    return r.json()
+
+
+def qb_acesso():
+    """Devolve (access_token, realm_id). Salva o refresh novo — ele gira todo dia."""
+    linha = qb_ler()
+    if not linha or not linha.get("refresh_token"):
+        raise HTTPException(428, "QuickBooks não está conectado. "
+                                 "Abra /qb/connect uma vez para autorizar.")
+    j = qb_token(refresh=linha["refresh_token"])
+    novo = j.get("refresh_token")
+    if novo and novo != linha["refresh_token"]:
+        qb_gravar(linha["realm_id"], novo)
+    return j["access_token"], linha["realm_id"]
+
+
+# ---------------------------------------------------------- chamadas
+def qb_get(caminho, params=None):
+    tok, realm = qb_acesso()
+    p = dict(params or {})
+    p["minorversion"] = QB_MINOR
+    r = requests.get(f"{QB_API}/{realm}/{caminho}",
+                     headers={"Authorization": "Bearer " + tok,
+                              "Accept": "application/json"},
+                     params=p, timeout=90)
+    if not r.ok:
+        raise HTTPException(502, f"QuickBooks ({r.status_code}): {r.text[:200]}")
+    return r.json()
+
+
+def qb_query(sql):
+    return qb_get("query", {"query": sql}).get("QueryResponse", {})
+
+
+def _esc_sql(v):
+    return str(v or "").replace("'", "''")
+
+
+# ---------------------------------------------------------- busca do projeto
+def qb_por_estimate(num):
+    """Acha o projeto pelo número da estimate escrito no memo da fatura."""
+    q = ("select Id, CustomerRef, PrivateNote from Invoice "
+         "where PrivateNote like '%Estimate " + _esc_sql(num) + "%' maxresults 5")
+    inv = (qb_query(q).get("Invoice") or [])
+    for i in inv:
+        ref = i.get("CustomerRef") or {}
+        if ref.get("value"):
+            return {"id": ref["value"], "nome": ref.get("name", ""),
+                    "via": "estimate"}
+    return None
+
+
+def qb_por_endereco(rua, cidade=""):
+    """Acha o projeto pelo endereço que está dentro do nome do projeto."""
+    chave = _re.sub(r"\s+", " ", str(rua or "")).strip()
+    if len(chave) < 5:
+        return None
+    q = ("select Id, DisplayName from Customer where Active = true "
+         "and DisplayName like '%" + _esc_sql(chave) + "%' maxresults 10")
+    lista = (qb_query(q).get("Customer") or [])
+    if not lista:
+        return None
+    if cidade:
+        c = cidade.lower()
+        exato = [x for x in lista if c in (x.get("DisplayName", "")).lower()]
+        if exato:
+            lista = exato
+    x = lista[0]
+    return {"id": x["Id"], "nome": x.get("DisplayName", ""), "via": "endereco",
+            "outros": [y.get("DisplayName", "") for y in lista[1:5]]}
+
+
+# ---------------------------------------------------------- números
+def qb_faturas(cid):
+    q = ("select Id, DocNumber, TotalAmt, Balance, TxnDate, DueDate, PrivateNote "
+         "from Invoice where CustomerRef = '" + _esc_sql(cid) + "' maxresults 200")
+    inv = (qb_query(q).get("Invoice") or [])
+    faturado = sum(float(i.get("TotalAmt") or 0) for i in inv)
+    saldo = sum(float(i.get("Balance") or 0) for i in inv)
+    itens = [{"num": i.get("DocNumber"), "valor": float(i.get("TotalAmt") or 0),
+              "saldo": float(i.get("Balance") or 0), "data": i.get("TxnDate"),
+              "vence": i.get("DueDate"), "memo": i.get("PrivateNote", "")}
+             for i in inv]
+    itens.sort(key=lambda x: x.get("data") or "")
+    return {"faturado": faturado, "saldo": saldo, "recebido": faturado - saldo,
+            "faturas": itens}
+
+
+def _pl_valor(rows, alvo):
+    """Varre o relatório e devolve o total do grupo pedido."""
+    for row in (rows or []):
+        if row.get("group") == alvo:
+            col = ((row.get("Summary") or {}).get("ColData") or [])
+            if len(col) > 1:
+                try:
+                    return float(str(col[1].get("value") or 0).replace(",", ""))
+                except ValueError:
+                    return 0.0
+        filhos = (row.get("Rows") or {}).get("Row")
+        if filhos:
+            v = _pl_valor(filhos, alvo)
+            if v is not None:
+                return v
+    return None
+
+
+def qb_custos(cid):
+    """Lucro do projeto pelo relatório de P&L filtrado por aquele projeto."""
+    rel = qb_get("reports/ProfitAndLoss",
+                 {"customer": cid, "start_date": "2015-01-01",
+                  "end_date": _date.today().isoformat(),
+                  "accounting_method": "Accrual"})
+    linhas = (rel.get("Rows") or {}).get("Row") or []
+    receita = _pl_valor(linhas, "Income") or 0.0
+    cogs = _pl_valor(linhas, "COGS") or 0.0
+    desp = _pl_valor(linhas, "Expenses") or 0.0
+    liquido = _pl_valor(linhas, "NetIncome")
+    custos = cogs + desp
+    if liquido is None:
+        liquido = receita - custos
+    return {"receita": receita, "custos": custos, "cogs": cogs,
+            "despesas": desp, "lucro": liquido}
+
+
+# ---------------------------------------------------------- rotas
+@app.get("/qb/connect")
+def qb_connect():
+    if not QB_ID or not SERVICE_URL:
+        raise HTTPException(500, "Faltam QB_CLIENT_ID / SERVICE_URL no Render.")
+    estado = _secrets.token_urlsafe(16)
+    _qb_estado[estado] = True
+    url = (QB_AUTH + "?client_id=" + QB_ID +
+           "&response_type=code&scope=com.intuit.quickbooks.accounting" +
+           "&redirect_uri=" + requests.utils.quote(QB_REDIRECT, safe="") +
+           "&state=" + estado)
+    return RedirectResponse(url)
+
+
+@app.get("/qb/callback")
+def qb_callback(code: str = "", state: str = "", realmId: str = ""):
+    if not code or not realmId:
+        return HTMLResponse("<h3>Autorização cancelada.</h3>", status_code=400)
+    _qb_estado.pop(state, None)
+    j = qb_token(codigo=code)
+    qb_gravar(realmId, j.get("refresh_token"))
+    return HTMLResponse(
+        "<div style='font-family:system-ui;padding:40px;text-align:center'>"
+        "<h2>QuickBooks conectado</h2>"
+        "<p>Empresa " + realmId + ". Pode fechar esta aba.</p></div>")
+
+
+@app.get("/qb/disconnect")
+def qb_disconnect():
+    """A Intuit exige um endereço de desconexão. Apaga o token guardado."""
+    try:
+        requests.delete(f"{SUPABASE_URL}/rest/v1/qb_tokens",
+                        params={"id": "eq.1"}, headers=qb_sb_headers(),
+                        timeout=30)
+    except Exception:
+        pass
+    return HTMLResponse(
+        "<div style='font-family:system-ui;padding:40px;text-align:center'>"
+        "<h2>QuickBooks disconnected</h2>"
+        "<p>PLJ Schedule no longer has access to your QuickBooks data.</p>"
+        "<p><a href='/qb/connect'>Connect again</a></p></div>")
+
+
+@app.get("/qb/status")
+def qb_status():
+    linha = qb_ler()
+    if not linha:
+        return {"conectado": False}
+    try:
+        tok, realm = qb_acesso()
+        info = qb_get("companyinfo/" + realm).get("CompanyInfo", {})
+        return {"conectado": True, "realm": realm,
+                "empresa": info.get("CompanyName", "")}
+    except HTTPException as e:
+        return {"conectado": False, "erro": e.detail}
+
+
+class ProjReq(BaseModel):
+    num: str = ""
+    rua: str = ""
+    cidade: str = ""
+
+
+@app.post("/qb/projeto")
+def qb_projeto(req: ProjReq, authorization: str = Header(default="")):
+    check_admin(authorization)
+    proj = None
+    if req.num:
+        proj = qb_por_estimate(req.num)
+    if not proj and req.rua:
+        proj = qb_por_endereco(req.rua, req.cidade)
+    if not proj:
+        return {"ok": False, "motivo": "Projeto não encontrado no QuickBooks."}
+
+    fat = qb_faturas(proj["id"])
+    try:
+        pl = qb_custos(proj["id"])
+    except HTTPException:
+        pl = {"receita": fat["faturado"], "custos": 0.0, "lucro": 0.0}
+
+    base = pl["receita"] or fat["faturado"]
+    pct = round((pl["custos"] / base) * 100, 1) if base else None
+    margem = round((pl["lucro"] / base) * 100, 1) if base else None
+    return {"ok": True, "projeto": proj["nome"], "id": proj["id"],
+            "via": proj.get("via"), "outros": proj.get("outros", []),
+            "faturado": round(fat["faturado"], 2),
+            "recebido": round(fat["recebido"], 2),
+            "deve": round(fat["saldo"], 2),
+            "custos": round(pl["custos"], 2),
+            "lucro": round(pl["lucro"], 2),
+            "pct_gasto": pct, "margem": margem,
+            "faturas": fat["faturas"][:12]}
