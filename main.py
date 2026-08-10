@@ -539,10 +539,19 @@ def qb_ler():
 
 
 def qb_gravar(realm, refresh):
-    requests.post(f"{SUPABASE_URL}/rest/v1/qb_tokens",
-                  headers={**qb_sb_headers(), "Prefer": "resolution=merge-duplicates"},
-                  json={"id": 1, "realm_id": realm, "refresh_token": refresh},
-                  timeout=30)
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/qb_tokens",
+                      headers={**qb_sb_headers(),
+                               "Prefer": "resolution=merge-duplicates"},
+                      json={"id": 1, "realm_id": realm,
+                            "refresh_token": refresh},
+                      timeout=30)
+    if not r.ok:
+        log.error("Falha ao salvar o token do QuickBooks: %s %s",
+                  r.status_code, (r.text or "")[:300])
+        raise HTTPException(500,
+            "A autorização funcionou, mas não consegui salvar o token. "
+            "A tabela qb_tokens existe no Supabase? Detalhe: "
+            + (r.text or "")[:200])
 
 
 RECONECTAR = ("A autorização do QuickBooks expirou ou foi revogada. "
@@ -643,15 +652,24 @@ def _esc_sql(v):
 
 # ---------------------------------------------------------- busca do projeto
 def qb_por_estimate(num):
-    """Acha o projeto pelo número da estimate escrito no memo da fatura."""
-    q = ("select Id, CustomerRef, PrivateNote from Invoice "
-         "where PrivateNote like '%Estimate " + _esc_sql(num) + "%' maxresults 5")
-    inv = (qb_query(q).get("Invoice") or [])
-    for i in inv:
-        ref = i.get("CustomerRef") or {}
-        if ref.get("value"):
-            return {"id": ref["value"], "nome": ref.get("name", ""),
-                    "via": "estimate"}
+    """Tenta achar pelo número da estimate.
+
+    O QuickBooks NÃO permite consultar pelo memo (PrivateNote não é
+    pesquisável), então o caminho é a entidade Estimate pelo número do
+    documento — só funciona se a estimate também existir dentro do QBO.
+    Quando não existe, devolve None e quem manda é o endereço.
+    """
+    try:
+        q = ("select Id, DocNumber, CustomerRef from Estimate "
+             "where DocNumber = '" + _esc_sql(num) + "' maxresults 5")
+        est = (qb_query(q).get("Estimate") or [])
+        for e in est:
+            ref = e.get("CustomerRef") or {}
+            if ref.get("value"):
+                return {"id": ref["value"], "nome": ref.get("name", ""),
+                        "via": "estimate"}
+    except HTTPException:
+        pass
     return None
 
 
@@ -786,7 +804,9 @@ def qb_disconnect():
 def qb_status():
     linha = qb_ler()
     if not linha:
-        return {"conectado": False}
+        return {"conectado": False,
+                "motivo": "Nenhum token salvo. Rode o qb_tokens.sql no Supabase "
+                          "e depois abra /qb/connect de novo."}
     try:
         tok, realm = qb_acesso()
         info = qb_get("companyinfo/" + realm).get("CompanyInfo", {})
@@ -806,12 +826,15 @@ class ProjReq(BaseModel):
 def qb_projeto(req: ProjReq, authorization: str = Header(default="")):
     check_admin(authorization)
     proj = None
-    if req.num:
-        proj = qb_por_estimate(req.num)
-    if not proj and req.rua:
+    if req.rua:
         proj = qb_por_endereco(req.rua, req.cidade)
+    if not proj and req.num:
+        proj = qb_por_estimate(req.num)
     if not proj:
-        return {"ok": False, "motivo": "Projeto não encontrado no QuickBooks."}
+        return {"ok": False,
+                "motivo": ("Projeto não encontrado no QuickBooks. "
+                           "Confira se o endereço do card é o mesmo que está "
+                           "no nome do projeto lá.")}
 
     fat = qb_faturas(proj["id"])
     try:
@@ -819,11 +842,19 @@ def qb_projeto(req: ProjReq, authorization: str = Header(default="")):
     except HTTPException:
         pl = {"receita": fat["faturado"], "custos": 0.0, "lucro": 0.0}
 
+    confere = None
+    if req.num:
+        marca = "estimate " + str(req.num).strip().lower()
+        bate = [f for f in fat["faturas"]
+                if marca in (f.get("memo") or "").lower()]
+        confere = bool(bate)
+
     base = pl["receita"] or fat["faturado"]
     pct = round((pl["custos"] / base) * 100, 1) if base else None
     margem = round((pl["lucro"] / base) * 100, 1) if base else None
     return {"ok": True, "projeto": proj["nome"], "id": proj["id"],
             "via": proj.get("via"), "outros": proj.get("outros", []),
+            "confere_estimate": confere,
             "faturado": round(fat["faturado"], 2),
             "recebido": round(fat["recebido"], 2),
             "deve": round(fat["saldo"], 2),
