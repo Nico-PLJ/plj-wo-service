@@ -878,6 +878,70 @@ def qb_faturas_recentes(meses=18):
     return todas
 
 
+def _pl_por_coluna(linhas, alvo, qtd):
+    """Acha a linha de um grupo e devolve os valores de cada coluna."""
+    for row in (linhas or []):
+        if row.get("group") == alvo:
+            col = ((row.get("Summary") or {}).get("ColData") or [])
+            out = []
+            for i in range(qtd):
+                v = col[i].get("value") if i < len(col) else ""
+                try:
+                    out.append(float(str(v or 0).replace(",", "")))
+                except ValueError:
+                    out.append(0.0)
+            return out
+        filhos = (row.get("Rows") or {}).get("Row")
+        if filhos:
+            v = _pl_por_coluna(filhos, alvo, qtd)
+            if v is not None:
+                return v
+    return None
+
+
+def qb_margens():
+    """Receita, custo e margem de TODOS os projetos numa única chamada.
+
+    Usa o P&L quebrado por cliente (summarize_column_by=Customers), em vez de
+    um relatório por obra — seriam dezenas de chamadas.
+    """
+    rel = qb_get("reports/ProfitAndLoss",
+                 {"summarize_column_by": "Customers",
+                  "start_date": "2015-01-01",
+                  "end_date": _date.today().isoformat(),
+                  "accounting_method": "Accrual"})
+    cols = (rel.get("Columns") or {}).get("Column") or []
+    titulos = [c.get("ColTitle") or "" for c in cols]
+    n = len(titulos)
+    linhas = (rel.get("Rows") or {}).get("Row") or []
+    receita = _pl_por_coluna(linhas, "Income", n) or [0.0] * n
+    cogs = _pl_por_coluna(linhas, "COGS", n) or [0.0] * n
+    desp = _pl_por_coluna(linhas, "Expenses", n) or [0.0] * n
+    liq = _pl_por_coluna(linhas, "NetIncome", n)
+
+    saida = {}
+    for i, t in enumerate(titulos):
+        if not t or t.lower() in ("total", ""):
+            continue
+        r = receita[i] if i < len(receita) else 0.0
+        c = (cogs[i] if i < len(cogs) else 0.0) + (desp[i] if i < len(desp) else 0.0)
+        l = (liq[i] if (liq and i < len(liq)) else (r - c))
+        saida[t] = {"receita": round(r, 2), "custos": round(c, 2),
+                    "lucro": round(l, 2),
+                    "margem": (round((l / r) * 100, 1) if r else None),
+                    "pct_gasto": (round((c / r) * 100, 1) if r else None)}
+    return saida
+
+
+@app.get("/qb/margens")
+def qb_margens_rota(authorization: str = Header(default="")):
+    quem_e(authorization)
+    try:
+        return {"ok": True, "projetos": qb_margens()}
+    except HTTPException as e:
+        return {"ok": False, "motivo": str(e.detail)}
+
+
 @app.get("/qb/abertas")
 def qb_abertas(authorization: str = Header(default="")):
     """Todas as faturas em aberto, somadas por projeto. Uma chamada só."""
