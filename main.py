@@ -937,7 +937,27 @@ def qb_margens():
 def qb_margens_rota(authorization: str = Header(default="")):
     quem_e(authorization)
     try:
-        return {"ok": True, "projetos": qb_margens()}
+        rel = qb_get("reports/ProfitAndLoss",
+                     {"summarize_column_by": "Customers",
+                      "start_date": "2015-01-01",
+                      "end_date": _date.today().isoformat(),
+                      "accounting_method": "Accrual"})
+        cols = (rel.get("Columns") or {}).get("Column") or []
+        titulos = [c.get("ColTitle") or "" for c in cols]
+        grupos = []
+
+        def varre(rows, nivel=0):
+            for r in (rows or []):
+                g = r.get("group") or r.get("type") or ""
+                if g:
+                    grupos.append(g)
+                f = (r.get("Rows") or {}).get("Row")
+                if f and nivel < 2:
+                    varre(f, nivel + 1)
+        varre((rel.get("Rows") or {}).get("Row") or [])
+        return {"ok": True, "projetos": qb_margens(),
+                "debug": {"colunas": titulos[:12], "qtd_colunas": len(titulos),
+                          "grupos": sorted(set(grupos))[:14]}}
     except HTTPException as e:
         return {"ok": False, "motivo": str(e.detail)}
 
