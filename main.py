@@ -368,6 +368,27 @@ def build_pdf(out_path, wo, cliente, endereco, vendedor, servicos, photos):
 
 
 # ---------------------------------------------------------------- supabase
+def quem_e(authorization):
+    """Devolve (email, papel) de quem está chamando."""
+    if not authorization:
+        raise HTTPException(401, "Sem token.")
+    tok = authorization.replace("Bearer ", "").strip()
+    u = requests.get(f"{SUPABASE_URL}/auth/v1/user",
+                     headers={"Authorization": "Bearer " + tok,
+                              "apikey": SUPABASE_ANON_KEY}, timeout=30)
+    if not u.ok:
+        raise HTTPException(401, "Token inválido.")
+    email = (u.json() or {}).get("email")
+    q = requests.get(f"{SUPABASE_URL}/rest/v1/app_users",
+                     params={"email": f"eq.{email}", "select": "role,name"},
+                     headers={"Authorization": "Bearer " + SUPABASE_SERVICE_KEY,
+                              "apikey": SUPABASE_SERVICE_KEY}, timeout=30)
+    linhas = q.json() if q.ok else []
+    if not linhas:
+        raise HTTPException(403, "Usuário sem permissão.")
+    return email, (linhas[0].get("role") or ""), (linhas[0].get("name") or "")
+
+
 def check_admin(authorization):
     if not authorization:
         raise HTTPException(401, "Sem token.")
@@ -819,9 +840,9 @@ def qb_status():
 @app.get("/qb/abertas")
 def qb_abertas(authorization: str = Header(default="")):
     """Todas as faturas em aberto, somadas por projeto. Uma chamada só."""
-    check_admin(authorization)
-    q = ("select Id, DocNumber, CustomerRef, TotalAmt, Balance, TxnDate, DueDate "
-         "from Invoice where Balance > '0' maxresults 1000")
+    quem_e(authorization)          # basta estar cadastrado no schedule
+    q = ("select Id, DocNumber, CustomerRef, TotalAmt, Balance, TxnDate, "
+         "DueDate, PrivateNote from Invoice where Balance > '0' maxresults 1000")
     inv = (qb_query(q).get("Invoice") or [])
     por = {}
     for i in inv:
@@ -832,17 +853,24 @@ def qb_abertas(authorization: str = Header(default="")):
             continue
         d = por.setdefault(nome, {"projeto": nome, "id": cid,
                                   "saldo": 0.0, "faturado": 0.0, "qtd": 0,
-                                  "vence": None})
-        d["saldo"] += float(i.get("Balance") or 0)
+                                  "vence": None, "faturas": []})
+        saldo = float(i.get("Balance") or 0)
+        d["saldo"] += saldo
         d["faturado"] += float(i.get("TotalAmt") or 0)
         d["qtd"] += 1
         v = i.get("DueDate")
         if v and (d["vence"] is None or v < d["vence"]):
             d["vence"] = v
+        d["faturas"].append({"num": i.get("DocNumber"),
+                             "valor": round(float(i.get("TotalAmt") or 0), 2),
+                             "saldo": round(saldo, 2),
+                             "data": i.get("TxnDate"), "vence": v,
+                             "memo": i.get("PrivateNote", "")})
     lista = sorted(por.values(), key=lambda x: -x["saldo"])
     for d in lista:
         d["saldo"] = round(d["saldo"], 2)
         d["faturado"] = round(d["faturado"], 2)
+        d["faturas"].sort(key=lambda f: f.get("data") or "")
     return {"ok": True, "total": round(sum(d["saldo"] for d in lista), 2),
             "projetos": lista}
 
@@ -855,7 +883,7 @@ class ProjReq(BaseModel):
 
 @app.post("/qb/projeto")
 def qb_projeto(req: ProjReq, authorization: str = Header(default="")):
-    check_admin(authorization)
+    quem_e(authorization)          # basta estar cadastrado no schedule
     proj = None
     if req.rua:
         proj = qb_por_endereco(req.rua, req.cidade)
