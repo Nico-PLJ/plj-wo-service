@@ -837,13 +837,52 @@ def qb_status():
         return {"conectado": False, "erro": e.detail}
 
 
+CAMPOS_INV = ("Id, DocNumber, CustomerRef, TotalAmt, Balance, TxnDate, "
+              "DueDate, PrivateNote")
+
+
+def qb_faturas_recentes(meses=18):
+    """Faturas dos últimos meses + qualquer uma antiga ainda em aberto.
+
+    Traz também as já pagas, porque a planilha precisa mostrar 'Pago'.
+    Pagina de mil em mil, que é o teto do QuickBooks por consulta.
+    """
+    from datetime import timedelta
+    corte = (_date.today() - timedelta(days=int(meses * 30.5))).isoformat()
+    vistas, todas = set(), []
+
+    def junta(lista):
+        for i in lista:
+            k = i.get("Id")
+            if k and k not in vistas:
+                vistas.add(k)
+                todas.append(i)
+
+    pos = 1
+    for _ in range(6):
+        q = (f"select {CAMPOS_INV} from Invoice where TxnDate >= '{corte}' "
+             f"order by TxnDate startposition {pos} maxresults 1000")
+        lote = qb_query(q).get("Invoice") or []
+        junta(lote)
+        if len(lote) < 1000:
+            break
+        pos += 1000
+
+    # em aberto mais antigas que o corte
+    q2 = (f"select {CAMPOS_INV} from Invoice where Balance > '0' "
+          f"and TxnDate < '{corte}' maxresults 1000")
+    try:
+        junta(qb_query(q2).get("Invoice") or [])
+    except HTTPException:
+        pass
+    return todas
+
+
 @app.get("/qb/abertas")
 def qb_abertas(authorization: str = Header(default="")):
     """Todas as faturas em aberto, somadas por projeto. Uma chamada só."""
     quem_e(authorization)          # basta estar cadastrado no schedule
-    q = ("select Id, DocNumber, CustomerRef, TotalAmt, Balance, TxnDate, "
-         "DueDate, PrivateNote from Invoice where Balance > '0' maxresults 1000")
-    inv = (qb_query(q).get("Invoice") or [])
+    inv = qb_faturas_recentes()
     por = {}
     for i in inv:
         ref = i.get("CustomerRef") or {}
@@ -866,7 +905,8 @@ def qb_abertas(authorization: str = Header(default="")):
                              "saldo": round(saldo, 2),
                              "data": i.get("TxnDate"), "vence": v,
                              "memo": i.get("PrivateNote", "")})
-    lista = sorted(por.values(), key=lambda x: -x["saldo"])
+    lista = [d for d in por.values() if d["saldo"] > 0.004]
+    lista.sort(key=lambda x: -x["saldo"])
     for d in lista:
         d["saldo"] = round(d["saldo"], 2)
         d["faturado"] = round(d["faturado"], 2)
@@ -921,3 +961,167 @@ def qb_projeto(req: ProjReq, authorization: str = Header(default="")):
             "lucro": round(pl["lucro"], 2),
             "pct_gasto": pct, "margem": margem,
             "faturas": fat["faturas"][:12]}
+
+
+# =====================================================================
+# PLANILHA DE COBRANÇA (.xlsx) — no formato que a equipe já usa
+# =====================================================================
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+VERDE = "C6E0B4"
+VERM = "FF5B5B"
+AMAR = "FFE699"
+CINZA = "D9D9D9"
+ESCURO = "404040"
+BRANCO = "FFFFFF"
+
+COLUNAS = [("Cliente", 30), ("Estimate", 11), ("Down", 12), ("Middle", 12),
+           ("Data Middle", 13), ("Situação", 15), ("Final", 12),
+           ("Data Final", 13), ("Situação", 15), ("Status", 16),
+           ("Total em aberto", 15), ("Observação", 52)]
+
+BORDA = Border(*[Side(style="thin", color="BFBFBF")] * 4)
+
+
+class LinhaPlan(BaseModel):
+    pm: str = ""
+    cliente: str = ""
+    estimate: str = ""
+    down: float = 0
+    middle: float = 0
+    data_middle: str = ""
+    sit_middle: str = ""
+    final: float = 0
+    data_final: str = ""
+    sit_final: str = ""
+    status: str = ""
+    aberto: float = 0
+    obs: str = ""
+
+
+class PlanReq(BaseModel):
+    titulo: str = "Cobranças"
+    linhas: list[LinhaPlan] = []
+
+
+def _cor_situacao(txt):
+    t = (txt or "").lower()
+    if "pago" in t:
+        return VERDE
+    if "atras" in t:
+        return VERM
+    if "prazo" in t:
+        return VERDE
+    if "sem data" in t:
+        return AMAR
+    return None
+
+
+def monta_planilha(req):
+    """Monta o arquivo e devolve os bytes. Separado para poder testar."""
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    por_pm = {}
+    for l in req.linhas:
+        por_pm.setdefault(l.pm or "Sem PM", []).append(l)
+
+    ordem = sorted(por_pm.keys())
+    if len(ordem) > 1:
+        ordem = ["TODOS"] + ordem
+        por_pm["TODOS"] = list(req.linhas)
+
+    for pm in ordem:
+        linhas = por_pm[pm]
+        aba = wb.create_sheet((pm or "Sem PM")[:28] or "Sem PM")
+
+        # faixa com o nome do PM
+        aba.merge_cells(start_row=1, start_column=1,
+                        end_row=1, end_column=len(COLUNAS))
+        c = aba.cell(row=1, column=1, value=pm.upper())
+        c.font = Font(bold=True, size=13, color=BRANCO)
+        c.fill = PatternFill("solid", fgColor=ESCURO)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        aba.row_dimensions[1].height = 24
+
+        # cabeçalho
+        for i, (nome, larg) in enumerate(COLUNAS, start=1):
+            h = aba.cell(row=2, column=i, value=nome)
+            h.font = Font(bold=True, size=10)
+            h.fill = PatternFill("solid", fgColor=CINZA)
+            h.alignment = Alignment(horizontal="center", vertical="center",
+                                    wrap_text=True)
+            h.border = BORDA
+            aba.column_dimensions[get_column_letter(i)].width = larg
+        aba.row_dimensions[2].height = 28
+
+        linhas.sort(key=lambda x: ((x.cliente or "").upper(), x.estimate or ""))
+        r = 3
+        tot_aberto = 0.0
+        for l in linhas:
+            atrasado = ("atras" in (l.sit_middle or "").lower()
+                        or "atras" in (l.sit_final or "").lower())
+            valores = [l.cliente, l.estimate, l.down or None, l.middle or None,
+                       l.data_middle, l.sit_middle, l.final or None,
+                       l.data_final, l.sit_final, l.status,
+                       l.aberto or None, l.obs]
+            for i, v in enumerate(valores, start=1):
+                cel = aba.cell(row=r, column=i, value=v)
+                cel.border = BORDA
+                cel.font = Font(size=10, bold=(i == 1))
+                if i in (3, 4, 7, 11):
+                    cel.number_format = '"$"#,##0.00'
+                    cel.alignment = Alignment(horizontal="right")
+                elif i in (2, 5, 6, 8, 9, 10):
+                    cel.alignment = Alignment(horizontal="center")
+                else:
+                    cel.alignment = Alignment(vertical="center", wrap_text=True)
+                if i in (6, 9):
+                    cor = _cor_situacao(v)
+                    if cor:
+                        cel.fill = PatternFill("solid", fgColor=cor)
+                        cel.font = Font(size=10, bold=True)
+                if i == 10:
+                    st = (v or "").lower()
+                    if "complet" in st:
+                        cel.fill = PatternFill("solid", fgColor=VERDE)
+                    elif "hold" in st or "pausad" in st:
+                        cel.fill = PatternFill("solid", fgColor=AMAR)
+                if i == 12 and atrasado and v:
+                    cel.fill = PatternFill("solid", fgColor=VERM)
+                    cel.font = Font(size=10, bold=True)
+            tot_aberto += float(l.aberto or 0)
+            r += 1
+
+        # total
+        t = aba.cell(row=r, column=10, value="TOTAL EM ABERTO")
+        t.font = Font(bold=True, size=10)
+        t.alignment = Alignment(horizontal="right")
+        tv = aba.cell(row=r, column=11, value=tot_aberto)
+        tv.font = Font(bold=True, size=11)
+        tv.number_format = '"$"#,##0.00'
+        tv.fill = PatternFill("solid", fgColor=CINZA)
+        tv.border = BORDA
+
+        aba.freeze_panes = "A3"
+        aba.auto_filter.ref = f"A2:{get_column_letter(len(COLUNAS))}{max(2, r - 1)}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@app.post("/planilha")
+def planilha(req: PlanReq, authorization: str = Header(default="")):
+    quem_e(authorization)
+    dados = monta_planilha(req)
+    nome = ("cobrancas_" + _re.sub(r"[^A-Za-z0-9]+", "_", req.titulo or "plj")
+            + "_" + _date.today().isoformat() + ".xlsx")
+    return StreamingResponse(
+        io.BytesIO(dados),
+        media_type=("application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet"),
+        headers={"Content-Disposition": f'attachment; filename="{nome}"'})
