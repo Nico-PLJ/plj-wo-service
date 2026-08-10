@@ -816,6 +816,37 @@ def qb_status():
         return {"conectado": False, "erro": e.detail}
 
 
+@app.get("/qb/abertas")
+def qb_abertas(authorization: str = Header(default="")):
+    """Todas as faturas em aberto, somadas por projeto. Uma chamada só."""
+    check_admin(authorization)
+    q = ("select Id, DocNumber, CustomerRef, TotalAmt, Balance, TxnDate, DueDate "
+         "from Invoice where Balance > '0' maxresults 1000")
+    inv = (qb_query(q).get("Invoice") or [])
+    por = {}
+    for i in inv:
+        ref = i.get("CustomerRef") or {}
+        nome = ref.get("name") or ""
+        cid = ref.get("value") or ""
+        if not nome:
+            continue
+        d = por.setdefault(nome, {"projeto": nome, "id": cid,
+                                  "saldo": 0.0, "faturado": 0.0, "qtd": 0,
+                                  "vence": None})
+        d["saldo"] += float(i.get("Balance") or 0)
+        d["faturado"] += float(i.get("TotalAmt") or 0)
+        d["qtd"] += 1
+        v = i.get("DueDate")
+        if v and (d["vence"] is None or v < d["vence"]):
+            d["vence"] = v
+    lista = sorted(por.values(), key=lambda x: -x["saldo"])
+    for d in lista:
+        d["saldo"] = round(d["saldo"], 2)
+        d["faturado"] = round(d["faturado"], 2)
+    return {"ok": True, "total": round(sum(d["saldo"] for d in lista), 2),
+            "projetos": lista}
+
+
 class ProjReq(BaseModel):
     num: str = ""
     rua: str = ""
