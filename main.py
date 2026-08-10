@@ -14,13 +14,19 @@ Fluxo:
 """
 import os
 import io
+import time
 import json
 import glob
 import base64
 import tempfile
 import subprocess
 
+import logging
 import requests
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("plj")
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -489,11 +495,32 @@ QB_ID = os.environ.get("QB_CLIENT_ID", "")
 QB_SECRET = os.environ.get("QB_CLIENT_SECRET", "")
 SERVICE_URL = os.environ.get("SERVICE_URL", "").rstrip("/")
 QB_REDIRECT = SERVICE_URL + "/qb/callback"
-QB_AUTH = "https://appcenter.intuit.com/connect/oauth2"
-QB_TOKEN = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+QB_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_configuration"
+QB_AUTH_PADRAO = "https://appcenter.intuit.com/connect/oauth2"
+QB_TOKEN_PADRAO = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 QB_API = "https://quickbooks.api.intuit.com/v3/company"
 QB_MINOR = "75"
 _qb_estado = {}
+_qb_cache = {"access": None, "exp": 0, "realm": None}
+_qb_endp = {"auth": None, "token": None, "quando": 0}
+
+
+def qb_endpoints():
+    """Pega os endereços no discovery document da Intuit (com reserva fixa)."""
+    agora = time.time()
+    if _qb_endp["auth"] and (agora - _qb_endp["quando"]) < 86400:
+        return _qb_endp["auth"], _qb_endp["token"]
+    a, t = QB_AUTH_PADRAO, QB_TOKEN_PADRAO
+    try:
+        r = requests.get(QB_DISCOVERY, timeout=20)
+        if r.ok:
+            j = r.json()
+            a = j.get("authorization_endpoint") or a
+            t = j.get("token_endpoint") or t
+    except Exception:
+        pass
+    _qb_endp.update({"auth": a, "token": t, "quando": agora})
+    return a, t
 
 
 # ---------------------------------------------------------- tokens
@@ -518,20 +545,53 @@ def qb_gravar(realm, refresh):
                   timeout=30)
 
 
+RECONECTAR = ("A autorização do QuickBooks expirou ou foi revogada. "
+              "Abra /qb/connect para reconectar.")
+
+
 def qb_token(codigo=None, refresh=None):
+    """Troca código ou refresh por um token. Uma nova tentativa em falha passageira."""
+    _, url = qb_endpoints()
     dados = ({"grant_type": "authorization_code", "code": codigo,
               "redirect_uri": QB_REDIRECT} if codigo else
              {"grant_type": "refresh_token", "refresh_token": refresh})
-    r = requests.post(QB_TOKEN, data=dados,
-                      auth=(QB_ID, QB_SECRET),
-                      headers={"Accept": "application/json"}, timeout=60)
-    if not r.ok:
-        raise HTTPException(502, f"QuickBooks recusou o token: {r.text[:200]}")
-    return r.json()
+    ultimo = ""
+    for tentativa in (1, 2):
+        try:
+            r = requests.post(url, data=dados, auth=(QB_ID, QB_SECRET),
+                              headers={"Accept": "application/json"}, timeout=60)
+        except requests.RequestException as e:
+            ultimo = str(e)
+            time.sleep(1.5)
+            continue
+        if r.ok:
+            return r.json()
+        corpo = (r.text or "")[:300]
+        log.warning("QBO token erro %s | intuit_tid=%s | %s", r.status_code,
+                    r.headers.get("intuit_tid", ""), corpo)
+        # invalid_grant = refresh expirado ou acesso revogado: não adianta repetir
+        if r.status_code == 400 and "invalid_grant" in corpo:
+            _qb_cache.update({"access": None, "exp": 0})
+            raise HTTPException(428, RECONECTAR)
+        if r.status_code in (401, 403):
+            raise HTTPException(428, RECONECTAR)
+        ultimo = corpo
+        if r.status_code < 500:
+            break
+        time.sleep(1.5)
+    raise HTTPException(502, f"QuickBooks recusou o token: {ultimo}")
 
 
-def qb_acesso():
-    """Devolve (access_token, realm_id). Salva o refresh novo — ele gira todo dia."""
+def qb_acesso(forcar=False):
+    """Devolve (access_token, realm_id).
+
+    O token de acesso dura 1 hora: guardamos em memória e só renovamos
+    quando falta pouco. O refresh gira sozinho e é sempre regravado.
+    """
+    agora = time.time()
+    if (not forcar and _qb_cache["access"] and _qb_cache["realm"]
+            and agora < _qb_cache["exp"]):
+        return _qb_cache["access"], _qb_cache["realm"]
     linha = qb_ler()
     if not linha or not linha.get("refresh_token"):
         raise HTTPException(428, "QuickBooks não está conectado. "
@@ -540,21 +600,37 @@ def qb_acesso():
     novo = j.get("refresh_token")
     if novo and novo != linha["refresh_token"]:
         qb_gravar(linha["realm_id"], novo)
-    return j["access_token"], linha["realm_id"]
+    dur = int(j.get("expires_in") or 3600)
+    _qb_cache.update({"access": j["access_token"], "realm": linha["realm_id"],
+                      "exp": agora + max(60, dur - 300)})
+    return _qb_cache["access"], _qb_cache["realm"]
 
 
 # ---------------------------------------------------------- chamadas
 def qb_get(caminho, params=None):
-    tok, realm = qb_acesso()
+    """Chama a API. Se o token tiver expirado, renova e tenta de novo uma vez."""
     p = dict(params or {})
     p["minorversion"] = QB_MINOR
-    r = requests.get(f"{QB_API}/{realm}/{caminho}",
-                     headers={"Authorization": "Bearer " + tok,
-                              "Accept": "application/json"},
-                     params=p, timeout=90)
-    if not r.ok:
-        raise HTTPException(502, f"QuickBooks ({r.status_code}): {r.text[:200]}")
-    return r.json()
+    for tentativa in (1, 2):
+        tok, realm = qb_acesso(forcar=(tentativa == 2))
+        r = requests.get(f"{QB_API}/{realm}/{caminho}",
+                         headers={"Authorization": "Bearer " + tok,
+                                  "Accept": "application/json"},
+                         params=p, timeout=90)
+        tid = r.headers.get("intuit_tid", "")
+        if r.ok:
+            return r.json()
+        log.warning("QBO erro %s em %s | intuit_tid=%s | %s",
+                    r.status_code, caminho, tid, (r.text or "")[:400])
+        if r.status_code == 401 and tentativa == 1:
+            continue          # token venceu: renova e repete
+        if r.status_code == 429:
+            log.warning("QBO limite de chamadas atingido | intuit_tid=%s", tid)
+            time.sleep(2)
+            continue          # limite de chamadas: espera e repete
+        raise HTTPException(502, f"QuickBooks ({r.status_code}) "
+                                 f"[intuit_tid {tid or 'n/d'}]: {r.text[:200]}")
+    raise HTTPException(502, "QuickBooks não respondeu.")
 
 
 def qb_query(sql):
@@ -656,9 +732,13 @@ def qb_custos(cid):
 def qb_connect():
     if not QB_ID or not SERVICE_URL:
         raise HTTPException(500, "Faltam QB_CLIENT_ID / SERVICE_URL no Render.")
-    estado = _secrets.token_urlsafe(16)
-    _qb_estado[estado] = True
-    url = (QB_AUTH + "?client_id=" + QB_ID +
+    estado = _secrets.token_urlsafe(24)
+    _qb_estado[estado] = time.time()
+    # limpa estados velhos (mais de 15 min)
+    for k in [k for k, v in _qb_estado.items() if time.time() - v > 900]:
+        _qb_estado.pop(k, None)
+    auth_url, _ = qb_endpoints()
+    url = (auth_url + "?client_id=" + QB_ID +
            "&response_type=code&scope=com.intuit.quickbooks.accounting" +
            "&redirect_uri=" + requests.utils.quote(QB_REDIRECT, safe="") +
            "&state=" + estado)
@@ -669,6 +749,13 @@ def qb_connect():
 def qb_callback(code: str = "", state: str = "", realmId: str = ""):
     if not code or not realmId:
         return HTMLResponse("<h3>Autorização cancelada.</h3>", status_code=400)
+    # CSRF: o state tem que ser um que nós mesmos criamos
+    if not state or state not in _qb_estado:
+        return HTMLResponse(
+            "<div style='font-family:system-ui;padding:40px;text-align:center'>"
+            "<h2>Pedido inválido</h2><p>O código de segurança (state) não confere. "
+            "Comece de novo em <a href='/qb/connect'>/qb/connect</a>.</p></div>",
+            status_code=400)
     _qb_estado.pop(state, None)
     j = qb_token(codigo=code)
     qb_gravar(realmId, j.get("refresh_token"))
@@ -687,6 +774,7 @@ def qb_disconnect():
                         timeout=30)
     except Exception:
         pass
+    _qb_cache.update({"access": None, "exp": 0, "realm": None})
     return HTMLResponse(
         "<div style='font-family:system-ui;padding:40px;text-align:center'>"
         "<h2>QuickBooks disconnected</h2>"
