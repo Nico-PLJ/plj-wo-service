@@ -668,7 +668,22 @@ def qb_query(sql):
 
 
 def _esc_sql(v):
-    return str(v or "").replace("'", "''")
+    """Escapa para a linguagem de consulta do QuickBooks (barra invertida)."""
+    return (str(v or "").replace("\\", "\\\\").replace("'", "\\'"))
+
+
+def _chave_busca(v):
+    """Termo seguro para o LIKE: corta no apóstrofo.
+
+    Endereços como "97 Lunn's Way" viram "97 Lunn", que já é específico o
+    bastante e não depende de escape nenhum.
+    """
+    t = _re.sub(r"\s+", " ", str(v or "")).strip()
+    if "'" in t or "\u2019" in t:
+        corte = _re.split(r"['\u2019]", t)[0].strip()
+        if len(corte) >= 5:
+            return corte
+    return t
 
 
 # ---------------------------------------------------------- busca do projeto
@@ -696,7 +711,7 @@ def qb_por_estimate(num):
 
 def qb_por_endereco(rua, cidade=""):
     """Acha o projeto pelo endereço que está dentro do nome do projeto."""
-    chave = _re.sub(r"\s+", " ", str(rua or "")).strip()
+    chave = _chave_busca(rua)
     if len(chave) < 5:
         return None
     q = ("select Id, DisplayName from Customer where Active = true "
@@ -1010,9 +1025,15 @@ def qb_projeto(req: ProjReq, authorization: str = Header(default="")):
     quem_e(authorization)          # basta estar cadastrado no schedule
     proj = None
     if req.rua:
-        proj = qb_por_endereco(req.rua, req.cidade)
+        try:
+            proj = qb_por_endereco(req.rua, req.cidade)
+        except HTTPException as e:
+            log.warning("Busca por endereço falhou (%s): %s", req.rua, e.detail)
     if not proj and req.num:
-        proj = qb_por_estimate(req.num)
+        try:
+            proj = qb_por_estimate(req.num)
+        except HTTPException as e:
+            log.warning("Busca por estimate falhou (%s): %s", req.num, e.detail)
     if not proj:
         return {"ok": False,
                 "motivo": ("Projeto não encontrado no QuickBooks. "
