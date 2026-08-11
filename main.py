@@ -709,6 +709,57 @@ def qb_por_estimate(num):
     return None
 
 
+_inv_cache = {"quando": 0, "dados": None}
+
+
+def qb_faturas_cache():
+    """Guarda as faturas recentes por 10 min — usada para casar pelo memo."""
+    agora = time.time()
+    if _inv_cache["dados"] and (agora - _inv_cache["quando"]) < 600:
+        return _inv_cache["dados"]
+    d = qb_faturas_recentes()
+    _inv_cache.update({"quando": agora, "dados": d})
+    return d
+
+
+def qb_por_memo(num):
+    """Acha o projeto pelo número da estimate escrito no memo da fatura.
+
+    O QuickBooks não deixa consultar o memo, então varremos as faturas que já
+    baixamos. É a ligação mais confiável: independe do endereço, que muda
+    quando a obra não é na casa onde o cliente mora.
+    """
+    n = str(num or "").strip()
+    if not n:
+        return None
+    padrao = _re.compile(r"estimate\s*#?\s*" + _re.escape(n) + r"(?!\d)", _re.I)
+    for i in qb_faturas_cache():
+        if padrao.search(i.get("PrivateNote") or ""):
+            ref = i.get("CustomerRef") or {}
+            if ref.get("value"):
+                return {"id": ref["value"], "nome": ref.get("name", ""),
+                        "via": "estimate"}
+    return None
+
+
+@app.get("/qb/buscar")
+def qb_buscar(q: str = "", authorization: str = Header(default="")):
+    """Lista projetos do QuickBooks por parte do nome — para ligar na mão."""
+    quem_e(authorization)
+    termo = _chave_busca(q)
+    if len(termo) < 3:
+        return {"ok": True, "projetos": []}
+    sql = ("select Id, DisplayName from Customer where Active = true "
+           "and DisplayName like '%" + _esc_sql(termo) + "%' maxresults 20")
+    try:
+        lista = (qb_query(sql).get("Customer") or [])
+    except HTTPException as e:
+        return {"ok": False, "motivo": str(e.detail)}
+    return {"ok": True, "projetos": [{"id": c["Id"],
+                                      "nome": c.get("DisplayName", "")}
+                                     for c in lista]}
+
+
 def qb_por_endereco(rua, cidade=""):
     """Acha o projeto pelo endereço que está dentro do nome do projeto."""
     chave = _chave_busca(rua)
@@ -1018,27 +1069,45 @@ class ProjReq(BaseModel):
     num: str = ""
     rua: str = ""
     cidade: str = ""
+    qbid: str = ""
 
 
 @app.post("/qb/projeto")
 def qb_projeto(req: ProjReq, authorization: str = Header(default="")):
     quem_e(authorization)          # basta estar cadastrado no schedule
     proj = None
-    if req.rua:
+    # 1) ligação feita à mão manda em tudo
+    if req.qbid:
+        nome = ""
+        try:
+            c = (qb_query("select Id, DisplayName from Customer where Id = '"
+                          + _esc_sql(req.qbid) + "'").get("Customer") or [])
+            nome = c[0].get("DisplayName", "") if c else ""
+        except HTTPException:
+            pass
+        proj = {"id": req.qbid, "nome": nome or ("Projeto " + req.qbid),
+                "via": "manual"}
+    # 2) número da estimate (independe do endereço)
+    if not proj and req.num:
+        for tentativa in (qb_por_memo, qb_por_estimate):
+            try:
+                proj = tentativa(req.num)
+            except HTTPException as e:
+                log.warning("Busca por estimate falhou (%s): %s",
+                            req.num, e.detail)
+            if proj:
+                break
+    # 3) endereço, como última opção
+    if not proj and req.rua:
         try:
             proj = qb_por_endereco(req.rua, req.cidade)
         except HTTPException as e:
             log.warning("Busca por endereço falhou (%s): %s", req.rua, e.detail)
-    if not proj and req.num:
-        try:
-            proj = qb_por_estimate(req.num)
-        except HTTPException as e:
-            log.warning("Busca por estimate falhou (%s): %s", req.num, e.detail)
     if not proj:
         return {"ok": False,
                 "motivo": ("Projeto não encontrado no QuickBooks. "
-                           "Confira se o endereço do card é o mesmo que está "
-                           "no nome do projeto lá.")}
+                           "Preencha o número da estimate, ou use "
+                           "\"Link project\" para escolher na mão.")}
 
     fat = qb_faturas(proj["id"])
     try:
