@@ -742,6 +742,204 @@ def qb_por_memo(num):
     return None
 
 
+# ---------------------------------------------------------- mão de obra
+_tempo_cache = {"quando": 0, "dados": None}
+
+
+def qb_tempo_recente(meses=24):
+    """Todos os apontamentos de hora dos últimos meses."""
+    from datetime import timedelta
+    corte = (_date.today() - timedelta(days=int(meses * 30.5))).isoformat()
+    todas, pos = [], 1
+    for _ in range(6):
+        q = ("select * from TimeActivity where TxnDate >= '" + corte + "' "
+             "startposition " + str(pos) + " maxresults 1000")
+        lote = qb_query(q).get("TimeActivity") or []
+        todas += lote
+        if len(lote) < 1000:
+            break
+        pos += 1000
+    return todas
+
+
+def qb_tempo_cache():
+    agora = time.time()
+    if _tempo_cache["dados"] and (agora - _tempo_cache["quando"]) < 600:
+        return _tempo_cache["dados"]
+    try:
+        d = qb_tempo_recente()
+    except HTTPException as e:
+        log.warning("Não consegui ler as horas: %s", e.detail)
+        d = []
+    _tempo_cache.update({"quando": agora, "dados": d})
+    return d
+
+
+def _pessoa_de(t):
+    for k in ("EmployeeRef", "VendorRef"):
+        r = t.get(k) or {}
+        if r.get("name"):
+            return r["name"]
+    return (t.get("NameOf") or "").strip() or "—"
+
+
+_auto_cache = {"quando": 0, "dados": None}
+
+
+def qb_rates_auto():
+    """Descobre o valor/hora sozinho, sem ninguém digitar.
+
+    Procura em três lugares, nesta ordem:
+      1. CostRate gravado no próprio apontamento de hora
+      2. HourlyRate do apontamento
+      3. BillRate do cadastro do funcionário ou do prestador
+    """
+    agora = time.time()
+    if _auto_cache["dados"] and (agora - _auto_cache["quando"]) < 600:
+        return _auto_cache["dados"]
+
+    achado = {}
+
+    def guarda(nome, valor, origem):
+        v = float(valor or 0)
+        if nome and v > 0 and nome not in achado:
+            achado[nome] = {"rate": v, "origem": origem}
+
+    for t in qb_tempo_cache():
+        n = _pessoa_de(t)
+        guarda(n, t.get("CostRate"), "apontamento (CostRate)")
+    for t in qb_tempo_cache():
+        n = _pessoa_de(t)
+        guarda(n, t.get("HourlyRate"), "apontamento (HourlyRate)")
+
+    for entidade in ("Employee", "Vendor"):
+        try:
+            reg = qb_query("select * from " + entidade
+                           + " where Active = true maxresults 500")
+            for e in (reg.get(entidade) or []):
+                nome = (e.get("DisplayName")
+                        or " ".join(x for x in [e.get("GivenName"),
+                                                e.get("FamilyName")] if x))
+                guarda(nome, e.get("BillRate"), entidade + ".BillRate")
+        except HTTPException as ex:
+            log.warning("Não li %s: %s", entidade, ex.detail)
+
+    _auto_cache.update({"quando": agora, "dados": achado})
+    return achado
+
+
+def qb_ler_rates():
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/qb_rates",
+                     params={"select": "nome,rate"},
+                     headers=qb_sb_headers(), timeout=30)
+    linhas = r.json() if r.ok else []
+    return {x["nome"]: float(x.get("rate") or 0) for x in linhas}
+
+
+def qb_horas_projeto(cid):
+    """Horas e custo de mão de obra de um projeto.
+
+    O valor/hora vem da tabela qb_rates; se a pessoa não estiver lá, usa o
+    que estiver gravado no próprio apontamento (CostRate/HourlyRate).
+    """
+    rates = qb_ler_rates()
+    auto = qb_rates_auto()
+    por_pessoa, horas_tot, custo_tot = {}, 0.0, 0.0
+    for t in qb_tempo_cache():
+        ref = (t.get("CustomerRef") or {}).get("value")
+        if str(ref or "") != str(cid):
+            continue
+        h = float(t.get("Hours") or 0) + (float(t.get("Minutes") or 0) / 60.0)
+        if h <= 0:
+            continue
+        nome = _pessoa_de(t)
+        taxa = rates.get(nome)
+        if not taxa:
+            a = auto.get(nome)
+            taxa = a["rate"] if a else 0.0
+        d = por_pessoa.setdefault(nome, {"nome": nome, "horas": 0.0,
+                                         "taxa": taxa, "custo": 0.0})
+        d["horas"] += h
+        d["custo"] += h * taxa
+        horas_tot += h
+        custo_tot += h * taxa
+    lista = sorted(por_pessoa.values(), key=lambda x: -x["custo"])
+    for d in lista:
+        d["horas"] = round(d["horas"], 2)
+        d["custo"] = round(d["custo"], 2)
+    return {"horas": round(horas_tot, 2), "custo": round(custo_tot, 2),
+            "pessoas": lista,
+            "sem_taxa": [d["nome"] for d in lista if not d["taxa"]]}
+
+
+@app.get("/qb/taxas")
+def qb_taxas(authorization: str = Header(default="")):
+    """Mostra o valor/hora encontrado de cada pessoa e a origem."""
+    quem_e(authorization)
+    manual = qb_ler_rates()
+    auto = qb_rates_auto()
+    horas = {}
+    campos = set()
+    for t in qb_tempo_cache():
+        h = float(t.get("Hours") or 0) + (float(t.get("Minutes") or 0) / 60.0)
+        n = _pessoa_de(t)
+        if h > 0:
+            horas[n] = horas.get(n, 0.0) + h
+        campos.update(k for k in t.keys() if "ate" in k or "Rate" in k)
+    saida = []
+    for n, h in sorted(horas.items(), key=lambda x: -x[1]):
+        a = auto.get(n)
+        saida.append({"nome": n, "horas": round(h, 1),
+                      "rate": manual.get(n) or (a["rate"] if a else 0),
+                      "origem": ("cadastro manual" if manual.get(n)
+                                 else (a["origem"] if a else "NÃO ENCONTRADO"))})
+    return {"ok": True, "pessoas": saida,
+            "campos_no_apontamento": sorted(campos)}
+
+
+@app.get("/qb/pessoas")
+def qb_pessoas(authorization: str = Header(default="")):
+    """Quem apontou hora e quanto está cadastrado por hora."""
+    quem_e(authorization)
+    rates = qb_ler_rates()
+    horas = {}
+    for t in qb_tempo_cache():
+        h = float(t.get("Hours") or 0) + (float(t.get("Minutes") or 0) / 60.0)
+        if h <= 0:
+            continue
+        n = _pessoa_de(t)
+        horas[n] = horas.get(n, 0.0) + h
+    auto = qb_rates_auto()
+    lista = []
+    for n, v in sorted(horas.items(), key=lambda x: -x[1]):
+        a = auto.get(n)
+        lista.append({"nome": n, "horas": round(v, 1),
+                      "rate": rates.get(n) or (a["rate"] if a else 0),
+                      "origem": ("manual" if rates.get(n)
+                                 else (a["origem"] if a else ""))})
+    return {"ok": True, "pessoas": lista}
+
+
+class RatesReq(BaseModel):
+    rates: dict[str, float] = {}
+
+
+@app.post("/qb/pessoas")
+def qb_pessoas_salvar(req: RatesReq, authorization: str = Header(default="")):
+    _, papel, _ = quem_e(authorization)
+    if papel != "admin":
+        raise HTTPException(403, "Só admin altera o custo por hora.")
+    linhas = [{"nome": n, "rate": float(v or 0)} for n, v in req.rates.items()]
+    if linhas:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/qb_rates",
+                          headers={**qb_sb_headers(),
+                                   "Prefer": "resolution=merge-duplicates"},
+                          json=linhas, timeout=30)
+        if not r.ok:
+            raise HTTPException(500, "Não consegui salvar: " + r.text[:200])
+    return {"ok": True, "salvos": len(linhas)}
+
+
 @app.get("/qb/buscar")
 def qb_buscar(q: str = "", authorization: str = Header(default="")):
     """Lista projetos do QuickBooks por parte do nome — para ligar na mão."""
@@ -1122,17 +1320,28 @@ def qb_projeto(req: ProjReq, authorization: str = Header(default="")):
                 if marca in (f.get("memo") or "").lower()]
         confere = bool(bate)
 
+    try:
+        mo = qb_horas_projeto(proj["id"])
+    except HTTPException:
+        mo = {"horas": 0.0, "custo": 0.0, "pessoas": [], "sem_taxa": []}
+
+    custos = pl["custos"] + mo["custo"]
+    lucro = pl["lucro"] - mo["custo"]
     base = pl["receita"] or fat["faturado"]
-    pct = round((pl["custos"] / base) * 100, 1) if base else None
-    margem = round((pl["lucro"] / base) * 100, 1) if base else None
+    pct = round((custos / base) * 100, 1) if base else None
+    margem = round((lucro / base) * 100, 1) if base else None
     return {"ok": True, "projeto": proj["nome"], "id": proj["id"],
             "via": proj.get("via"), "outros": proj.get("outros", []),
             "confere_estimate": confere,
             "faturado": round(fat["faturado"], 2),
             "recebido": round(fat["recebido"], 2),
             "deve": round(fat["saldo"], 2),
-            "custos": round(pl["custos"], 2),
-            "lucro": round(pl["lucro"], 2),
+            "custos": round(custos, 2),
+            "custos_material": round(pl["custos"], 2),
+            "mao_obra": round(mo["custo"], 2),
+            "horas": mo["horas"], "pessoas": mo["pessoas"],
+            "sem_taxa": mo["sem_taxa"],
+            "lucro": round(lucro, 2),
             "pct_gasto": pct, "margem": margem,
             "faturas": fat["faturas"][:12]}
 
