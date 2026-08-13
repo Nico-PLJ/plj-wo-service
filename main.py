@@ -986,7 +986,8 @@ def qb_faturas(cid):
     inv = (qb_query(q).get("Invoice") or [])
     faturado = sum(float(i.get("TotalAmt") or 0) for i in inv)
     saldo = sum(float(i.get("Balance") or 0) for i in inv)
-    itens = [{"num": i.get("DocNumber"), "valor": float(i.get("TotalAmt") or 0),
+    itens = [{"id": i.get("Id"),
+              "num": i.get("DocNumber"), "valor": float(i.get("TotalAmt") or 0),
               "saldo": float(i.get("Balance") or 0), "data": i.get("TxnDate"),
               "vence": i.get("DueDate"), "memo": i.get("PrivateNote", "")}
              for i in inv]
@@ -1512,6 +1513,226 @@ def planilha(req: PlanReq, authorization: str = Header(default="")):
 
 
 # =====================================================================
+# CRIAR E ENVIAR FATURA — o app passa a ESCREVER no QuickBooks.
+#
+# Até aqui tudo era leitura. Daqui para baixo o serviço cria documento
+# contábil de verdade, então cada rota confere o papel de quem chamou:
+# viewer não passa. O envio é uma chamada separada de propósito — criar
+# e mandar para o cliente são duas decisões diferentes.
+#
+# O escopo com.intuit.quickbooks.accounting, que já está autorizado,
+# cobre escrita. Não precisa reconectar o QuickBooks.
+# =====================================================================
+
+
+def qb_post(caminho, corpo=None, params=None, octeto=False):
+    """POST na API. Renova o token e repete uma vez se ele tiver vencido."""
+    p = dict(params or {})
+    p["minorversion"] = QB_MINOR
+    for tentativa in (1, 2):
+        tok, realm = qb_acesso(forcar=(tentativa == 2))
+        cabec = {"Authorization": "Bearer " + tok, "Accept": "application/json"}
+        if octeto:
+            # a rota de envio da Intuit exige corpo vazio e este content-type
+            cabec["Content-Type"] = "application/octet-stream"
+            r = requests.post(f"{QB_API}/{realm}/{caminho}", headers=cabec,
+                              params=p, data=b"", timeout=90)
+        else:
+            cabec["Content-Type"] = "application/json"
+            r = requests.post(f"{QB_API}/{realm}/{caminho}", headers=cabec,
+                              params=p, json=(corpo or {}), timeout=90)
+        tid = r.headers.get("intuit_tid", "")
+        if r.ok:
+            return r.json()
+        log.warning("QBO POST erro %s em %s | intuit_tid=%s | %s",
+                    r.status_code, caminho, tid, (r.text or "")[:400])
+        if r.status_code == 401 and tentativa == 1:
+            continue
+        detalhe = (r.text or "")[:300]
+        raise HTTPException(502, f"QuickBooks recusou ({r.status_code}) "
+                                 f"[intuit_tid {tid or 'n/d'}]: {detalhe}")
+    raise HTTPException(502, "QuickBooks não respondeu.")
+
+
+def _pode_faturar(authorization):
+    _, papel, nome = quem_e(authorization)
+    if papel not in ("admin", "pm"):
+        raise HTTPException(403, "Só admin ou project manager pode faturar.")
+    return papel, nome
+
+
+_rec_cache = {}       # usado aqui e pela seção do recebido, mais abaixo
+
+
+def _limpa_caches_fatura():
+    """A fatura nova precisa aparecer na hora, não daqui a 10 minutos."""
+    _inv_cache.update({"quando": 0, "dados": None})
+    _rec_cache.clear()
+
+
+@app.get("/qb/itens")
+def qb_itens(authorization: str = Header(default="")):
+    """Itens de serviço do QuickBooks — é o que o PM escolhe na linha."""
+    quem_e(authorization)
+    q = ("select Id, Name, Type, UnitPrice, Description from Item "
+         "where Active = true maxresults 500")
+    lista = (qb_query(q).get("Item") or [])
+    saida = []
+    for i in lista:
+        if (i.get("Type") or "") == "Category":
+            continue
+        saida.append({"id": i.get("Id"), "nome": i.get("Name", ""),
+                      "tipo": i.get("Type", ""),
+                      "descricao": i.get("Description", ""),
+                      "preco": float(i.get("UnitPrice") or 0)})
+    saida.sort(key=lambda x: (x["nome"] or "").lower())
+    return {"ok": True, "itens": saida}
+
+
+@app.get("/qb/cliente")
+def qb_cliente(qbid: str = "", authorization: str = Header(default="")):
+    """Nome e e-mail do projeto — para pré-preencher o envio."""
+    quem_e(authorization)
+    if not qbid:
+        raise HTTPException(400, "Sem projeto.")
+    c = (qb_query("select * from Customer where Id = '" + _esc_sql(qbid) + "'")
+         .get("Customer") or [])
+    if not c:
+        raise HTTPException(404, "Projeto não encontrado.")
+    x = c[0]
+    email = ((x.get("PrimaryEmailAddr") or {}).get("Address") or "")
+    return {"ok": True, "id": x.get("Id"), "nome": x.get("DisplayName", ""),
+            "email": email}
+
+
+def qb_get_pdf(caminho):
+    """Baixa um documento em PDF da API (fatura, orçamento)."""
+    p = {"minorversion": QB_MINOR}
+    for tentativa in (1, 2):
+        tok, realm = qb_acesso(forcar=(tentativa == 2))
+        r = requests.get(f"{QB_API}/{realm}/{caminho}",
+                         headers={"Authorization": "Bearer " + tok,
+                                  "Accept": "application/pdf"},
+                         params=p, timeout=90)
+        tid = r.headers.get("intuit_tid", "")
+        if r.ok and r.content[:4] == b"%PDF":
+            return r.content
+        log.warning("QBO PDF erro %s em %s | intuit_tid=%s | %s",
+                    r.status_code, caminho, tid, (r.text or "")[:300])
+        if r.status_code == 401 and tentativa == 1:
+            continue
+        raise HTTPException(502, f"QuickBooks não devolveu o PDF "
+                                 f"({r.status_code}) [intuit_tid {tid or 'n/d'}].")
+    raise HTTPException(502, "QuickBooks não respondeu.")
+
+
+class InvLinha(BaseModel):
+    item_id: str = ""
+    descricao: str = ""
+    valor: float = 0
+
+
+class InvReq(BaseModel):
+    qbid: str = ""            # Id do projeto (Customer) no QuickBooks
+    num: str = ""             # número da estimate, vai para o memo
+    linhas: list[InvLinha] = []
+    vence: str = ""           # YYYY-MM-DD
+    memo: str = ""
+
+
+@app.post("/qb/invoice")
+def qb_invoice_criar(req: InvReq, authorization: str = Header(default="")):
+    """Cria a fatura. NÃO envia nada para o cliente."""
+    papel, quem = _pode_faturar(authorization)
+    if not req.qbid:
+        raise HTTPException(400, "Sem projeto do QuickBooks.")
+    linhas = [l for l in req.linhas if float(l.valor or 0) > 0]
+    if not linhas:
+        raise HTTPException(400, "A fatura precisa de pelo menos uma linha "
+                                 "com valor maior que zero.")
+
+    corpo = {"CustomerRef": {"value": str(req.qbid)}, "Line": []}
+    for l in linhas:
+        valor = round(float(l.valor), 2)
+        det = {"Qty": 1, "UnitPrice": valor}
+        if l.item_id:
+            det["ItemRef"] = {"value": str(l.item_id)}
+        linha = {"Amount": valor, "DetailType": "SalesItemLineDetail",
+                 "SalesItemLineDetail": det}
+        if l.descricao:
+            linha["Description"] = l.descricao
+        corpo["Line"].append(linha)
+
+    if req.vence:
+        corpo["DueDate"] = req.vence
+
+    # mantém a convenção que já existe nas faturas de vocês
+    memo = (req.memo or "").strip()
+    if req.num and "estimate" not in memo.lower():
+        marca = "Estimate #" + str(req.num).strip()
+        memo = (marca + (" — " + memo if memo else ""))
+    if memo:
+        corpo["PrivateNote"] = memo
+
+    j = qb_post("invoice", corpo)
+    inv = j.get("Invoice") or {}
+    _limpa_caches_fatura()
+    log.info("Fatura %s criada no projeto %s por %s",
+             inv.get("DocNumber"), req.qbid, quem or papel)
+    return {"ok": True, "id": inv.get("Id"), "num": inv.get("DocNumber"),
+            "total": float(inv.get("TotalAmt") or 0),
+            "saldo": float(inv.get("Balance") or 0),
+            "vence": inv.get("DueDate"), "data": inv.get("TxnDate")}
+
+
+class EnvioReq(BaseModel):
+    invoice_id: str = ""
+    email: str = ""
+
+
+@app.get("/qb/invoice/pdf")
+def qb_invoice_pdf(invoice_id: str = "", num: str = "",
+                   authorization: str = Header(default="")):
+    """Devolve o PDF da fatura.
+
+    Não sobe para o Storage de propósito: o bucket das Work Orders é
+    público, e fatura tem valor e dado de cliente. Aqui o arquivo passa
+    autenticado e vai direto para o aparelho de quem pediu.
+    """
+    quem_e(authorization)          # basta estar cadastrado (viewer também)
+    if not invoice_id:
+        raise HTTPException(400, "Sem a fatura.")
+    dados = qb_get_pdf("invoice/" + str(invoice_id).strip() + "/pdf")
+    nome = "Invoice_" + (_re.sub(r"[^A-Za-z0-9_-]+", "", str(num or "")) or
+                         str(invoice_id)) + ".pdf"
+    return StreamingResponse(
+        io.BytesIO(dados), media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{nome}"'})
+
+
+@app.post("/qb/invoice/enviar")
+def qb_invoice_enviar(req: EnvioReq, authorization: str = Header(default="")):
+    """Manda a fatura por e-mail pelo próprio QuickBooks."""
+    papel, quem = _pode_faturar(authorization)
+    if not req.invoice_id:
+        raise HTTPException(400, "Sem a fatura.")
+    params = {}
+    destino = (req.email or "").strip()
+    if destino:
+        params["sendTo"] = destino
+    j = qb_post("invoice/" + str(req.invoice_id).strip() + "/send",
+                params=params, octeto=True)
+    inv = j.get("Invoice") or {}
+    log.info("Fatura %s enviada para %s por %s",
+             inv.get("DocNumber"), destino or "e-mail do cadastro",
+             quem or papel)
+    return {"ok": True, "num": inv.get("DocNumber"),
+            "enviado_para": destino or
+                            ((inv.get("BillEmail") or {}).get("Address") or ""),
+            "status": inv.get("EmailStatus", "")}
+
+
+# =====================================================================
 # RECEBIDO NO PERÍODO — alimenta a tabela de metas por PM
 #
 # Por que isto é necessário: o /qb/abertas só enxerga fatura EM ABERTO.
@@ -1519,9 +1740,6 @@ def planilha(req: PlanReq, authorization: str = Header(default="")):
 # saber por ali quanto entrou no mês. Os Payment do QuickBooks são o
 # registro da baixa, e é isso que esta rota lê.
 # =====================================================================
-
-_rec_cache = {}
-
 
 def qb_recebido_periodo(ini, fim):
     """Soma, por projeto, o dinheiro que entrou entre duas datas."""
