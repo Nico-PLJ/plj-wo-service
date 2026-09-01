@@ -1743,14 +1743,12 @@ def qb_invoice_enviar(req: EnvioReq, authorization: str = Header(default="")):
 
 _inv_cache = {}       # Id da fatura -> texto e classificação
 
-# Palavras que marcam uma fatura como entrada. A regra do Nico: entrada
-# não conta para o PM; middle e final contam, quantas partes tenham.
-# Está aqui em cima, e não espalhada no código, para ser fácil de ajustar
-# quando aparecer uma variação nova de escrita.
-PALAVRAS_DOWN = (
-    "down payment", "downpayment", "down pmt", "down-payment",
-    "downpmt", "deposit",
-)
+# O app já classifica faturas em tipoFatura(): procura "down", "middle",
+# "final", "full" no memo. Esta função segue o MESMO vocabulário — se as
+# duas divergirem, a tela mostra um tipo e o total soma outro, e ninguém
+# consegue conferir nada.
+PALAVRAS_DOWN = ("down", "deposit")
+PALAVRAS_CONTA = ("middle", "final", "full")
 
 
 def _texto_fatura(inv):
@@ -1772,6 +1770,14 @@ def _texto_fatura(inv):
 
 
 def _eh_entrada(texto):
+    """Entrada não conta para o PM; middle, final e full contam.
+
+    Middle e final ganham de "down" de propósito: uma fatura escrita
+    "middle payment - down the hall bathroom" é um middle. O caso
+    contrário (uma entrada que mencione "final") não aparece na prática.
+    """
+    if any(p in texto for p in PALAVRAS_CONTA):
+        return False
     return any(p in texto for p in PALAVRAS_DOWN)
 
 
