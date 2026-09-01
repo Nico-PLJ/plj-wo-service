@@ -1741,11 +1741,97 @@ def qb_invoice_enviar(req: EnvioReq, authorization: str = Header(default="")):
 # registro da baixa, e é isso que esta rota lê.
 # =====================================================================
 
-def qb_recebido_periodo(ini, fim):
-    """Soma, por projeto, o dinheiro que entrou entre duas datas."""
-    chave = str(ini) + ".." + str(fim)
+_inv_cache = {}       # Id da fatura -> texto e classificação
+
+# Palavras que marcam uma fatura como entrada. A regra do Nico: entrada
+# não conta para o PM; middle e final contam, quantas partes tenham.
+# Está aqui em cima, e não espalhada no código, para ser fácil de ajustar
+# quando aparecer uma variação nova de escrita.
+PALAVRAS_DOWN = (
+    "down payment", "downpayment", "down pmt", "down-payment",
+    "downpmt", "deposit",
+)
+
+
+def _texto_fatura(inv):
+    """Junta tudo o que pode conter a descrição, em minúsculas.
+
+    O texto vive em lugares diferentes conforme quem criou a fatura
+    (SumoQuote, QuickBooks à mão, importação), então olhamos todos.
+    """
+    partes = [
+        str(inv.get("DocNumber") or ""),
+        str(inv.get("PrivateNote") or ""),
+        str((inv.get("CustomerMemo") or {}).get("value") or ""),
+    ]
+    for ln in (inv.get("Line") or []):
+        partes.append(str(ln.get("Description") or ""))
+        det = ln.get("SalesItemLineDetail") or {}
+        partes.append(str((det.get("ItemRef") or {}).get("name") or ""))
+    return " | ".join(p for p in partes if p).lower()
+
+
+def _eh_entrada(texto):
+    return any(p in texto for p in PALAVRAS_DOWN)
+
+
+def qb_faturas_por_id(ids):
+    """Busca faturas pelo Id, em lotes, guardando o que já foi lido."""
+    faltam = [i for i in ids if i and i not in _inv_cache]
+    for k in range(0, len(faltam), 40):
+        lote = faltam[k:k + 40]
+        lista = "','".join(_esc_sql(str(x)) for x in lote)
+        try:
+            achadas = qb_query(
+                "select * from Invoice where Id in ('" + lista + "')"
+            ).get("Invoice") or []
+        except Exception:
+            achadas = []
+        for inv in achadas:
+            txt = _texto_fatura(inv)
+            _inv_cache[str(inv.get("Id"))] = {
+                "texto": txt,
+                "entrada": _eh_entrada(txt),
+                "doc": inv.get("DocNumber") or "",
+            }
+        # Fatura que o QuickBooks não devolveu não pode ficar sendo
+        # perguntada de novo a cada chamada: marca como desconhecida.
+        for x in lote:
+            _inv_cache.setdefault(str(x), {"texto": "", "entrada": False,
+                                           "doc": "", "desconhecida": True})
+    return _inv_cache
+
+
+def _linhas_do_pagamento(p):
+    """Devolve (id_da_fatura, valor) para cada parte do pagamento.
+
+    Um pagamento pode quitar mais de uma fatura de uma vez: nesse caso
+    cada parte é classificada por conta própria.
+    """
+    saida = []
+    for ln in (p.get("Line") or []):
+        val = float(ln.get("Amount") or 0)
+        if val <= 0:
+            continue
+        alvo = ""
+        for lt in (ln.get("LinkedTxn") or []):
+            if (lt.get("TxnType") or "") == "Invoice":
+                alvo = str(lt.get("TxnId") or "")
+                break
+        saida.append((alvo, val))
+    return saida
+
+
+def qb_recebido_periodo(ini, fim, detalhado=False):
+    """Soma, por projeto, o dinheiro que entrou entre duas datas.
+
+    Só conta middle e final. Entradas (down payment) ficam de fora do
+    total do PM, mesmo quando divididas em várias parcelas — a decisão
+    é tomada na FATURA, então todas as partes dela caem junto.
+    """
+    chave = "v2:" + str(ini) + ".." + str(fim)      # v2: regra nova
     guardado = _rec_cache.get(chave)
-    if guardado and (time.time() - guardado["quando"]) < 600:
+    if guardado and (time.time() - guardado["quando"]) < 600 and not detalhado:
         return guardado["dados"]
 
     todos, pos = [], 1
@@ -1760,28 +1846,69 @@ def qb_recebido_periodo(ini, fim):
             break
         pos += 1000
 
-    por = {}
+    # Uma consulta só para todas as faturas envolvidas, em lotes.
+    ids = set()
+    for p in todos:
+        for fid, _v in _linhas_do_pagamento(p):
+            if fid:
+                ids.add(fid)
+    qb_faturas_por_id(sorted(ids))
+
+    por, linhas = {}, []
     for p in todos:
         ref = p.get("CustomerRef") or {}
         nome = ref.get("name") or ""
         if not nome:
             continue
-        # UnappliedAmt é adiantamento ainda não amarrado a uma fatura:
-        # entrou no caixa, mas não abateu nada. Fica de fora.
-        valor = float(p.get("TotalAmt") or 0) - float(p.get("UnappliedAmt") or 0)
-        if valor <= 0:
-            continue
         d = por.setdefault(nome, {"projeto": nome,
                                   "id": ref.get("value") or "",
-                                  "recebido": 0.0, "qtd": 0})
-        d["recebido"] += valor
-        d["qtd"] += 1
+                                  "recebido": 0.0, "qtd": 0,
+                                  "entrada": 0.0, "semfatura": 0.0})
+        partes = _linhas_do_pagamento(p)
+        # Adiantamento sem fatura amarrada: entrou no caixa mas não
+        # abateu nada. Nunca contou e continua não contando.
+        naoaplicado = float(p.get("UnappliedAmt") or 0)
+        if not partes:
+            continue
+        for fid, val in partes:
+            inf = _inv_cache.get(fid) or {}
+            if not fid:
+                # parte sem fatura ligada: é adiantamento solto
+                d["semfatura"] += val
+                classe = "sem fatura"
+            elif inf.get("entrada"):
+                d["entrada"] += val
+                classe = "down payment"
+            else:
+                d["recebido"] += val
+                d["qtd"] += 1
+                classe = "conta"
+            if detalhado:
+                linhas.append({
+                    "projeto": nome,
+                    "data": p.get("TxnDate") or "",
+                    "pagamento": p.get("Id") or "",
+                    "fatura": inf.get("doc") or fid,
+                    "valor": round(val, 2),
+                    "classe": classe,
+                    "texto": (inf.get("texto") or "")[:160],
+                })
+        if naoaplicado > 0 and detalhado:
+            linhas.append({"projeto": nome, "data": p.get("TxnDate") or "",
+                           "pagamento": p.get("Id") or "", "fatura": "",
+                           "valor": round(naoaplicado, 2),
+                           "classe": "não aplicado", "texto": ""})
 
     lista = sorted(por.values(), key=lambda x: -x["recebido"])
     for d in lista:
         d["recebido"] = round(d["recebido"], 2)
-    _rec_cache[chave] = {"quando": time.time(), "dados": lista}
-    return lista
+        d["entrada"] = round(d["entrada"], 2)
+        d["semfatura"] = round(d["semfatura"], 2)
+    lista = [d for d in lista
+             if d["recebido"] or d["entrada"] or d["semfatura"]]
+    if not detalhado:
+        _rec_cache[chave] = {"quando": time.time(), "dados": lista}
+    return (lista, linhas) if detalhado else lista
 
 
 @app.get("/qb/recebido")
@@ -1800,4 +1927,34 @@ def qb_recebido(ini: str = "", fim: str = "",
     lista = qb_recebido_periodo(ini, fim)
     return {"ok": True, "ini": ini, "fim": fim,
             "total": round(sum(d["recebido"] for d in lista), 2),
+            "entradas": round(sum(d.get("entrada", 0) for d in lista), 2),
             "projetos": lista}
+
+
+@app.get("/qb/recebido/detalhe")
+def qb_recebido_detalhe(ini: str = "", fim: str = "",
+                        authorization: str = Header(default="")):
+    """Cada pagamento do período, a fatura que ele quitou e como foi
+    classificado.
+
+    Existe para conferir a regra contra o QuickBooks antes de confiar nos
+    totais: eu não tenho como ver como as faturas estão escritas, então
+    quem valida é quem olha. Se algum 'middle' aparecer como entrada, ou
+    o contrário, a coluna 'texto' mostra em cima de qual palavra a
+    decisão foi tomada.
+    """
+    quem_e(authorization)
+    hoje = _date.today()
+    if not ini:
+        ini = hoje.replace(day=1).isoformat()
+    if not fim:
+        fim = hoje.isoformat()
+    lista, linhas = qb_recebido_periodo(ini, fim, detalhado=True)
+    resumo = {}
+    for l in linhas:
+        resumo[l["classe"]] = round(resumo.get(l["classe"], 0) + l["valor"], 2)
+    return {"ok": True, "ini": ini, "fim": fim,
+            "palavras_entrada": list(PALAVRAS_DOWN),
+            "resumo_por_classe": resumo,
+            "conta_para_o_pm": round(sum(d["recebido"] for d in lista), 2),
+            "linhas": sorted(linhas, key=lambda x: (x["projeto"], x["data"]))}
