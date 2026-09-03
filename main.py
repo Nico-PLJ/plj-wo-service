@@ -959,24 +959,108 @@ def qb_buscar(q: str = "", authorization: str = Header(default="")):
                                      for c in lista]}
 
 
+_ABREV = {
+    "AVE": "AVENUE", "AV": "AVENUE", "ST": "STREET", "STR": "STREET",
+    "RD": "ROAD", "DR": "DRIVE", "LN": "LANE", "CT": "COURT",
+    "CIR": "CIRCLE", "PL": "PLACE", "TER": "TERRACE", "TERR": "TERRACE",
+    "HWY": "HIGHWAY", "BLVD": "BOULEVARD", "PKWY": "PARKWAY",
+    "SQ": "SQUARE", "TRL": "TRAIL", "PSGE": "PASSAGE", "PSG": "PASSAGE",
+    "XING": "CROSSING", "RT": "ROUTE", "EXT": "EXTENSION",
+}
+
+
+def _expande(t):
+    """Mesma normalização do app: abreviação vira palavra inteira.
+
+    Sem isto, "11 Bosuns Psge" no card nunca encontra "11 Bosuns Passage"
+    no QuickBooks — era essa a causa de projeto "não encontrado" mesmo
+    existindo.
+    """
+    p = _re.sub(r"[.,;:]+", " ", str(t or "").upper())
+    p = _re.sub(r"\s+", " ", p).strip().split(" ")
+    return [_ABREV.get(w, w) for w in p if w]
+
+
+def _numero_e_rua(rua):
+    """Devolve (número da casa, palavras da rua) já expandidas.
+
+    O número nem sempre é a primeira coisa: "MCINTYRE 21 Hidden Valley"
+    e "STAIRS - 6539 2 Daniel Lane" existem na agenda. Vale o primeiro
+    número seguido de uma palavra.
+    """
+    p = _expande(rua)
+    for i, w in enumerate(p):
+        if not _re.fullmatch(r"\d+[A-Z]?", w):
+            continue
+        resto = p[i + 1:]
+        if resto and _re.match(r"^[A-Z]", resto[0]):
+            return w, resto
+    return "", []
+
+
 def qb_por_endereco(rua, cidade=""):
-    """Acha o projeto pelo endereço que está dentro do nome do projeto."""
-    chave = _chave_busca(rua)
-    if len(chave) < 5:
+    """Acha o projeto pelo endereço que está dentro do nome do projeto.
+
+    Estratégia: procurar no QuickBooks só pela parte que não varia —
+    número + primeira palavra da rua — e conferir o resto aqui, onde dá
+    para expandir abreviações. Procurar a rua inteira falhava sempre que
+    os dois lados escreviam "Passage" e "Psge" de formas diferentes.
+    """
+    num, palavras = _numero_e_rua(rua)
+    if not num or not palavras:
         return None
-    q = ("select Id, DisplayName from Customer where Active = true "
-         "and DisplayName like '%" + _esc_sql(chave) + "%' maxresults 10")
-    lista = (qb_query(q).get("Customer") or [])
+
+    # A busca precisa de algo específico. Uma palavra basta na maioria;
+    # se for curtinha ("A", "Old"), usa duas.
+    quantas = 1 if len(palavras[0]) >= 4 else 2
+    alvo = _chave_busca(num + " " + " ".join(palavras[:quantas]))
+    if len(alvo) < 4:
+        return None
+
+    vistos, lista = set(), []
+    for termo in (alvo, num + " " + palavras[0]):
+        termo = _chave_busca(termo)
+        if termo in vistos or len(termo) < 4:
+            continue
+        vistos.add(termo)
+        q = ("select Id, DisplayName from Customer where Active = true "
+             "and DisplayName like '%" + _esc_sql(termo) + "%' maxresults 30")
+        try:
+            lista += (qb_query(q).get("Customer") or [])
+        except HTTPException:
+            pass
+        if lista:
+            break
     if not lista:
         return None
-    if cidade:
-        c = cidade.lower()
-        exato = [x for x in lista if c in (x.get("DisplayName", "")).lower()]
-        if exato:
-            lista = exato
-    x = lista[0]
+
+    def pontos(x):
+        """Quanto este candidato combina com o endereço do card."""
+        nome = _expande(x.get("DisplayName", ""))
+        nnum, nrua = _numero_e_rua(" ".join(nome))
+        # número da casa diferente elimina: "11 Bosuns" x "111 Bosuns"
+        if nnum and nnum != num:
+            return -1
+        if num not in nome:
+            return -1
+        p = 0
+        for w in palavras[:3]:
+            if w in nome:
+                p += 2
+        if cidade:
+            for w in _expande(cidade):
+                if w in nome:
+                    p += 1
+        return p
+
+    marcados = [(pontos(x), i, x) for i, x in enumerate(lista)]
+    marcados = [m for m in marcados if m[0] >= 2]      # ao menos a rua bate
+    if not marcados:
+        return None
+    marcados.sort(key=lambda m: (-m[0], m[1]))
+    x = marcados[0][2]
     return {"id": x["Id"], "nome": x.get("DisplayName", ""), "via": "endereco",
-            "outros": [y.get("DisplayName", "") for y in lista[1:5]]}
+            "outros": [y[2].get("DisplayName", "") for y in marcados[1:5]]}
 
 
 # ---------------------------------------------------------- números
