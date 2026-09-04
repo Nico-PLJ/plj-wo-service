@@ -1884,8 +1884,10 @@ def qb_faturas_por_id(ids):
                 "entrada": _eh_entrada(txt),
                 "doc": inv.get("DocNumber") or "",
             }
-        # Fatura que o QuickBooks não devolveu não pode ficar sendo
-        # perguntada de novo a cada chamada: marca como desconhecida.
+        # Fatura que o QuickBooks não devolveu fica marcada como
+        # DESCONHECIDA — e desconhecida não é o mesmo que "não é
+        # entrada". Antes eu punha entrada=False e o valor entrava no
+        # total do PM em silêncio: uma falha de leitura virava dinheiro.
         for x in lote:
             _inv_cache.setdefault(str(x), {"texto": "", "entrada": False,
                                            "doc": "", "desconhecida": True})
@@ -1953,7 +1955,8 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
         d = por.setdefault(nome, {"projeto": nome,
                                   "id": ref.get("value") or "",
                                   "recebido": 0.0, "qtd": 0,
-                                  "entrada": 0.0, "semfatura": 0.0})
+                                  "entrada": 0.0, "semfatura": 0.0,
+                                  "desconhecido": 0.0})
         partes = _linhas_do_pagamento(p)
         # Adiantamento sem fatura amarrada: entrou no caixa mas não
         # abateu nada. Nunca contou e continua não contando.
@@ -1966,6 +1969,11 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
                 # parte sem fatura ligada: é adiantamento solto
                 d["semfatura"] += val
                 classe = "sem fatura"
+            elif inf.get("desconhecida"):
+                # Não consegui ler a fatura: fica de lado, visível, em
+                # vez de entrar calado no total de alguém.
+                d["desconhecido"] = d.get("desconhecido", 0.0) + val
+                classe = "fatura não lida"
             elif inf.get("entrada"):
                 d["entrada"] += val
                 classe = "down payment"
@@ -1994,8 +2002,10 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
         d["recebido"] = round(d["recebido"], 2)
         d["entrada"] = round(d["entrada"], 2)
         d["semfatura"] = round(d["semfatura"], 2)
+        d["desconhecido"] = round(d.get("desconhecido", 0.0), 2)
     lista = [d for d in lista
-             if d["recebido"] or d["entrada"] or d["semfatura"]]
+             if d["recebido"] or d["entrada"] or d["semfatura"]
+             or d["desconhecido"]]
     if not detalhado:
         _rec_cache[chave] = {"quando": time.time(), "dados": lista}
     return (lista, linhas) if detalhado else lista
@@ -2018,7 +2028,37 @@ def qb_recebido(ini: str = "", fim: str = "",
     return {"ok": True, "ini": ini, "fim": fim,
             "total": round(sum(d["recebido"] for d in lista), 2),
             "entradas": round(sum(d.get("entrada", 0) for d in lista), 2),
+            "nao_lidas": round(sum(d.get("desconhecido", 0) for d in lista), 2),
             "projetos": lista}
+
+
+@app.get("/qb/recebido/cliente")
+def qb_recebido_cliente(nome: str = "", ini: str = "", fim: str = "",
+                        authorization: str = Header(default="")):
+    """Explica, para UM cliente, o que contou e o que não contou.
+
+    Feito para responder à pergunta "por que este down payment entrou no
+    total do PM?" sem ter que ler o relatório inteiro. Mostra a fatura,
+    o texto em que a decisão se baseou e a classificação.
+    """
+    quem_e(authorization)
+    hoje = _date.today()
+    if not ini:
+        ini = hoje.replace(day=1).isoformat()
+    if not fim:
+        fim = hoje.isoformat()
+    _lista, linhas = qb_recebido_periodo(ini, fim, detalhado=True)
+    alvo = (nome or "").strip().lower()
+    if alvo:
+        linhas = [l for l in linhas if alvo in (l["projeto"] or "").lower()]
+    resumo = {}
+    for l in linhas:
+        resumo[l["classe"]] = round(resumo.get(l["classe"], 0) + l["valor"], 2)
+    return {"ok": True, "cliente": nome, "ini": ini, "fim": fim,
+            "palavras_entrada": list(PALAVRAS_DOWN),
+            "palavras_que_contam": list(PALAVRAS_CONTA),
+            "resumo_por_classe": resumo,
+            "linhas": sorted(linhas, key=lambda x: x["data"])}
 
 
 @app.get("/qb/recebido/detalhe")
