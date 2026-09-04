@@ -1836,33 +1836,51 @@ PALAVRAS_CONTA = ("middle", "final", "full")
 
 
 def _texto_fatura(inv):
-    """Junta tudo o que pode conter a descrição, em minúsculas.
+    """Devolve (memo, texto completo), ambos em minúsculas.
 
-    O texto vive em lugares diferentes conforme quem criou a fatura
-    (SumoQuote, QuickBooks à mão, importação), então olhamos todos.
+    O memo é onde o app decide o tipo da fatura. O texto completo serve
+    de reserva, para quando o memo não disser nada.
     """
-    partes = [
-        str(inv.get("DocNumber") or ""),
-        str(inv.get("PrivateNote") or ""),
-        str((inv.get("CustomerMemo") or {}).get("value") or ""),
-    ]
+    memo = " | ".join(str(x) for x in [
+        inv.get("DocNumber") or "",
+        inv.get("PrivateNote") or "",
+        (inv.get("CustomerMemo") or {}).get("value") or "",
+    ] if x).lower()
+    resto = []
     for ln in (inv.get("Line") or []):
-        partes.append(str(ln.get("Description") or ""))
+        resto.append(str(ln.get("Description") or ""))
         det = ln.get("SalesItemLineDetail") or {}
-        partes.append(str((det.get("ItemRef") or {}).get("name") or ""))
-    return " | ".join(p for p in partes if p).lower()
+        resto.append(str((det.get("ItemRef") or {}).get("name") or ""))
+    inteiro = (memo + " | " + " | ".join(p for p in resto if p)).lower()
+    return memo, inteiro
+
+
+def _classifica(memo, inteiro):
+    """Entrada não conta para o PM; middle, final e full contam.
+
+    A ORDEM é a mesma do tipoFatura() do app: "down" ganha de
+    "middle"/"final". Eu tinha invertido, e o efeito era perverso — uma
+    fatura de down payment que citasse "final" em qualquer linha
+    aparecia como "Down Payment" na tela e entrava como recebimento no
+    total do PM. O rótulo que a pessoa vê e a conta que ela confere
+    precisam sair da mesma regra.
+
+    A decisão sai do MEMO quando ele disser algo, porque é o campo que o
+    app mostra. As descrições das linhas são só reserva.
+    """
+    for texto in (memo, inteiro):
+        if not texto:
+            continue
+        if any(p in texto for p in PALAVRAS_DOWN):
+            return True
+        if any(p in texto for p in PALAVRAS_CONTA):
+            return False
+    return False
 
 
 def _eh_entrada(texto):
-    """Entrada não conta para o PM; middle, final e full contam.
-
-    Middle e final ganham de "down" de propósito: uma fatura escrita
-    "middle payment - down the hall bathroom" é um middle. O caso
-    contrário (uma entrada que mencione "final") não aparece na prática.
-    """
-    if any(p in texto for p in PALAVRAS_CONTA):
-        return False
-    return any(p in texto for p in PALAVRAS_DOWN)
+    """Mantida para quem chama com um texto só."""
+    return _classifica(texto, texto)
 
 
 def qb_faturas_por_id(ids):
@@ -1878,10 +1896,10 @@ def qb_faturas_por_id(ids):
         except Exception:
             achadas = []
         for inv in achadas:
-            txt = _texto_fatura(inv)
+            memo, inteiro = _texto_fatura(inv)
             _inv_cache[str(inv.get("Id"))] = {
-                "texto": txt,
-                "entrada": _eh_entrada(txt),
+                "texto": (memo or inteiro),
+                "entrada": _classifica(memo, inteiro),
                 "doc": inv.get("DocNumber") or "",
             }
         # Fatura que o QuickBooks não devolveu fica marcada como
@@ -1921,7 +1939,7 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
     total do PM, mesmo quando divididas em várias parcelas — a decisão
     é tomada na FATURA, então todas as partes dela caem junto.
     """
-    chave = "v2:" + str(ini) + ".." + str(fim)      # v2: regra nova
+    chave = "v3:" + str(ini) + ".." + str(fim)      # v3: precedência de "down"
     guardado = _rec_cache.get(chave)
     if guardado and (time.time() - guardado["quando"]) < 600 and not detalhado:
         return guardado["dados"]
