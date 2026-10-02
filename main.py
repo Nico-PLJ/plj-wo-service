@@ -943,20 +943,66 @@ def qb_pessoas_salvar(req: RatesReq, authorization: str = Header(default="")):
 
 @app.get("/qb/buscar")
 def qb_buscar(q: str = "", authorization: str = Header(default="")):
-    """Lista projetos do QuickBooks por parte do nome — para ligar na mão."""
+    """Lista projetos do QuickBooks para ligar na mão.
+
+    Os projetos aqui se chamam "(Vendedor) Serviço - 26 Samoset Avenue":
+    quem procura usa o ENDEREÇO, não o nome do cliente. Um LIKE literal
+    falhava sempre que os dois lados escreviam "Road" e "Rd" de formas
+    diferentes — então, quando o texto parece um endereço, procuro só
+    pela parte que não varia (número + primeira palavra da rua) e
+    ordeno o resultado aqui, onde dá para expandir as abreviações.
+    """
     quem_e(authorization)
-    termo = _chave_busca(q)
-    if len(termo) < 3:
+    bruto = (q or "").strip()
+    if len(bruto) < 3:
         return {"ok": True, "projetos": []}
-    sql = ("select Id, DisplayName from Customer where Active = true "
-           "and DisplayName like '%" + _esc_sql(termo) + "%' maxresults 20")
-    try:
-        lista = (qb_query(sql).get("Customer") or [])
-    except HTTPException as e:
-        return {"ok": False, "motivo": str(e.detail)}
+
+    num, palavras = _numero_e_rua(bruto)
+    termos = []
+    if num and palavras:
+        termos.append(num + " " + palavras[0])     # "6 CARVER"
+    direto = _chave_busca(bruto)
+    if direto and direto not in termos:
+        termos.append(direto)
+
+    achados, vistos = [], set()
+    for termo in termos:
+        if len(termo) < 3:
+            continue
+        sql = ("select Id, DisplayName from Customer where Active = true "
+               "and DisplayName like '%" + _esc_sql(termo) + "%' maxresults 30")
+        try:
+            lista = (qb_query(sql).get("Customer") or [])
+        except HTTPException as e:
+            if not achados:
+                return {"ok": False, "motivo": str(e.detail)}
+            break
+        for c in lista:
+            if c["Id"] in vistos:
+                continue
+            vistos.add(c["Id"])
+            achados.append(c)
+        if achados:
+            break
+
+    def pontos(c):
+        """Quanto este projeto combina com o que foi digitado."""
+        nome = _expande(c.get("DisplayName", ""))
+        p = 0
+        if num and num in nome:
+            p += 3
+        for w in palavras[:3]:
+            if w in nome:
+                p += 2
+        for w in _expande(bruto):
+            if w in nome:
+                p += 1
+        return p
+
+    achados.sort(key=lambda c: -pontos(c))
     return {"ok": True, "projetos": [{"id": c["Id"],
                                       "nome": c.get("DisplayName", "")}
-                                     for c in lista]}
+                                     for c in achados[:20]]}
 
 
 _ABREV = {
