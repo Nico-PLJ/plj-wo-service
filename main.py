@@ -1044,6 +1044,113 @@ def _numero_e_rua(rua):
     return "", []
 
 
+def _pontua(nome_qb, num, palavras, cidade):
+    """Quanto um nome de projeto do QuickBooks combina com um endereço.
+
+    Separado de qb_por_endereco para que a varredura em lote use
+    EXATAMENTE a mesma regra do card. Duas implementações da mesma
+    decisão divergem — foi o que já aconteceu com o down payment, onde a
+    tela dizia uma coisa e o total somava outra.
+    """
+    nome = _expande(nome_qb)
+    nnum, _nrua = _numero_e_rua(" ".join(nome))
+    if nnum and nnum != num:
+        return -1
+    if num not in nome:
+        return -1
+    p = 0
+    for w in palavras[:3]:
+        if w in nome:
+            p += 2
+    if cidade:
+        for w in _expande(cidade):
+            if w in nome:
+                p += 1
+    return p
+
+
+def _casa_na_lista(rua, cidade, clientes):
+    """Acha o projeto para um endereço dentro de uma lista já carregada."""
+    num, palavras = _numero_e_rua(rua or "")
+    if not num or not palavras:
+        return None, "endereço sem número de casa reconhecível"
+    marcados = []
+    for c in clientes:
+        p = _pontua(c.get("DisplayName", ""), num, palavras, cidade)
+        if p >= 2:
+            marcados.append((p, c))
+    if not marcados:
+        return None, "nenhum projeto com este endereço"
+    marcados.sort(key=lambda m: -m[0])
+    if len(marcados) > 1 and marcados[0][0] == marcados[1][0]:
+        return marcados[0][1], "mais de um projeto empatado"
+    return marcados[0][1], ""
+
+
+def qb_todos_clientes():
+    """Todos os projetos ativos do QuickBooks, em páginas de 1000."""
+    fora, pos = [], 1
+    for _ in range(20):
+        q = ("select Id, DisplayName from Customer where Active = true "
+             "startposition " + str(pos) + " maxresults 1000")
+        lote = qb_query(q).get("Customer") or []
+        fora += lote
+        if len(lote) < 1000:
+            break
+        pos += 1000
+    return fora
+
+
+class VarreduraReq(BaseModel):
+    obras: list = []
+
+
+@app.post("/qb/varredura")
+def qb_varredura(req: VarreduraReq, authorization: str = Header(default="")):
+    """Diz, para cada obra da agenda, se ela acha projeto no QuickBooks.
+
+    Recebe a lista de obras do app e casa TODAS contra os projetos do
+    QuickBooks de uma vez. Fazer uma chamada por obra levaria minutos e
+    derrubaria o limite da Intuit; aqui é uma consulta e o resto em
+    memória.
+    """
+    quem_e(authorization)
+    try:
+        clientes = qb_todos_clientes()
+    except HTTPException as e:
+        return {"ok": False, "motivo": str(e.detail)}
+
+    porid = {str(c["Id"]): c.get("DisplayName", "") for c in clientes}
+    saida = []
+    for o in (req.obras or []):
+        addr = (o.get("addr") or "").strip()
+        rua = addr.split(",")[0].strip()
+        cid = ""
+        partes = [x.strip() for x in addr.split(",") if x.strip()]
+        if len(partes) >= 2:
+            cid = _re.sub(r"\s+[A-Z]{2}(\s+\d{5}(-\d{4})?)?$", "",
+                          partes[1]).strip()
+        qbid = str(o.get("qbid") or "").strip()
+        if qbid:
+            saida.append({"cliente": o.get("client", ""), "addr": addr,
+                          "estado": "ligado à mão",
+                          "projeto": porid.get(qbid, "(id " + qbid + ")"),
+                          "motivo": ""})
+            continue
+        achado, motivo = _casa_na_lista(rua, cid, clientes)
+        saida.append({"cliente": o.get("client", ""), "addr": addr,
+                      "estado": "achou" if achado else "NÃO ACHOU",
+                      "projeto": achado.get("DisplayName", "") if achado else "",
+                      "motivo": motivo})
+
+    nao = [x for x in saida if x["estado"] == "NÃO ACHOU"]
+    return {"ok": True,
+            "projetos_no_quickbooks": len(clientes),
+            "obras": len(saida),
+            "nao_acharam": len(nao),
+            "linhas": saida}
+
+
 def qb_por_endereco(rua, cidade=""):
     """Acha o projeto pelo endereço que está dentro do nome do projeto.
 
@@ -1080,26 +1187,10 @@ def qb_por_endereco(rua, cidade=""):
     if not lista:
         return None
 
-    def pontos(x):
-        """Quanto este candidato combina com o endereço do card."""
-        nome = _expande(x.get("DisplayName", ""))
-        nnum, nrua = _numero_e_rua(" ".join(nome))
-        # número da casa diferente elimina: "11 Bosuns" x "111 Bosuns"
-        if nnum and nnum != num:
-            return -1
-        if num not in nome:
-            return -1
-        p = 0
-        for w in palavras[:3]:
-            if w in nome:
-                p += 2
-        if cidade:
-            for w in _expande(cidade):
-                if w in nome:
-                    p += 1
-        return p
-
-    marcados = [(pontos(x), i, x) for i, x in enumerate(lista)]
+    # A mesma função que a varredura usa. Uma regra, um lugar: duas
+    # implementações divergem e aí a varredura diz que acha e o card não.
+    marcados = [(_pontua(x.get("DisplayName", ""), num, palavras, cidade),
+                 i, x) for i, x in enumerate(lista)]
     marcados = [m for m in marcados if m[0] >= 2]      # ao menos a rua bate
     if not marcados:
         return None
