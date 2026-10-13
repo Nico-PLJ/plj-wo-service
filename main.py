@@ -1486,6 +1486,71 @@ def qb_abertas(authorization: str = Header(default="")):
             "projetos": lista}
 
 
+# ---------------------------------------------------------------- jobnimbus: pipeline
+# Contagem de jobs por status, para o modo TV do schedule (?tv=1).
+# Só leitura. Fica em cache por 5 minutos para não martelar a API do JobNimbus.
+_JN_PIPE = {"t": 0, "dados": None}
+
+
+def jn_todos_jobs():
+    campos = ("jnid,name,display_name,status_name,record_type_name,sales_rep_name,"
+              "approved_estimate_total,last_estimate,date_status_change,"
+              "is_active,is_archived")
+    todos, inicio = [], 0
+    for _ in range(40):                                  # teto: 40 mil jobs
+        r = requests.get(f"{JN_BASE}/jobs", headers=jn_headers(),
+                         params={"size": 1000, "from": inicio, "fields": campos},
+                         timeout=60)
+        if not r.ok:
+            raise HTTPException(502, f"JobNimbus falhou ({r.status_code}).")
+        corpo = r.json() or {}
+        lote = corpo.get("results") or []
+        todos.extend(lote)
+        inicio += len(lote)
+        if not lote or inicio >= int(corpo.get("count") or 0):
+            break
+    return todos
+
+
+@app.get("/jn/pipeline")
+def jn_pipeline(authorization: str = Header(default=""), forcar: int = 0):
+    """Quantos jobs há em cada status do JobNimbus, com valor e os mais antigos."""
+    quem_e(authorization)          # basta estar cadastrado no schedule
+    if not forcar and _JN_PIPE["dados"] and time.time() - _JN_PIPE["t"] < 300:
+        return _JN_PIPE["dados"]
+    agora = time.time()
+    por = {}
+    total = 0
+    for j in jn_todos_jobs():
+        if j.get("is_archived") or j.get("is_active") is False:
+            continue
+        st = (j.get("status_name") or "Sem status").strip()
+        d = por.setdefault(st, {"status": st, "count": 0, "valor": 0.0,
+                                "parados_30d": 0, "jobs": []})
+        valor = float(j.get("approved_estimate_total") or j.get("last_estimate") or 0)
+        mudou = j.get("date_status_change") or 0
+        dias = int((agora - float(mudou)) / 86400) if mudou else None
+        d["count"] += 1
+        d["valor"] += valor
+        if dias is not None and dias > 30:
+            d["parados_30d"] += 1
+        d["jobs"].append({"nome": j.get("display_name") or j.get("name") or "",
+                          "vendedor": j.get("sales_rep_name") or "",
+                          "valor": round(valor, 2), "dias": dias})
+        total += 1
+    lista = list(por.values())
+    for d in lista:
+        d["valor"] = round(d["valor"], 2)
+        # os 5 parados há mais tempo, que são os que interessam na TV
+        d["jobs"].sort(key=lambda x: -(x["dias"] or 0))
+        d["jobs"] = d["jobs"][:5]
+    lista.sort(key=lambda x: -x["count"])
+    dados = {"ok": True, "total": total, "status": lista,
+             "atualizado": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    _JN_PIPE.update(t=agora, dados=dados)
+    return dados
+
+
 class ProjReq(BaseModel):
     num: str = ""
     rua: str = ""
