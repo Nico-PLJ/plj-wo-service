@@ -1212,7 +1212,11 @@ def qb_faturas(cid):
               "saldo": float(i.get("Balance") or 0), "data": i.get("TxnDate"),
               "vence": i.get("DueDate"), "memo": i.get("PrivateNote", "")}
              for i in inv]
-    itens.sort(key=lambda x: x.get("data") or "")
+
+    def _ordem(x):
+        n = str(x.get("num") or "")
+        return (x.get("data") or "", int(n) if n.isdigit() else 0, n)
+    itens.sort(key=_ordem)                   # mesma data: pelo número da fatura
     return {"faturado": faturado, "saldo": saldo, "recebido": faturado - saldo,
             "faturas": itens}
 
@@ -1631,7 +1635,11 @@ def qb_projeto(req: ProjReq, authorization: str = Header(default="")):
             "sem_taxa": mo["sem_taxa"],
             "lucro": round(lucro, 2),
             "pct_gasto": pct, "margem": margem,
-            "faturas": fat["faturas"][:12]}
+            # Antes cortava em 12 e sumia fatura de quem tem muitas (ex.: Janet
+            # Fogarty, 17 faturas). Agora vão todas, menos as anuladas de $0.
+            "faturas": [f for f in fat["faturas"]
+                        if not (abs(f["valor"]) < 0.005 and abs(f["saldo"]) < 0.005
+                                and "void" in (f.get("memo") or "").lower())]}
 
 
 # =====================================================================
