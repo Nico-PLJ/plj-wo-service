@@ -2316,3 +2316,454 @@ def qb_recebido_detalhe(ini: str = "", fim: str = "",
             "resumo_por_classe": resumo,
             "conta_para_o_pm": round(sum(d["recebido"] for d in lista), 2),
             "linhas": sorted(linhas, key=lambda x: (x["projeto"], x["data"]))}
+
+
+# =====================================================================
+# FINANCEIRO — painel de TV do financeiro (operacao.pljcarpentry.com/?tv=financeiro)
+#
+# Lê três planilhas do OneDrive pela Microsoft Graph (login Microsoft feito
+# uma vez em /ms/connect, igual ao do QuickBooks) e guarda uma "foto" por dia
+# na tabela fin_diario do Supabase. As planilhas são sobrescritas todo dia;
+# é a foto diária que permite mostrar os dias anteriores.
+#
+# Variáveis no Render:
+#   MS_CLIENT_ID, MS_CLIENT_SECRET   app registrado no Azure (contas pessoais)
+#   FIN_LINK_PERFORMANCE             link da planilha da performance (PLJ_Pagamentos)
+#   FIN_LINK_RECEBIMENTOS            link da planilha de recebimentos por PM/vendedor
+#   FIN_LINK_VENDAS                  link da planilha Controle Faturamento
+# Os links NÃO ficam no código: o repositório é público.
+# =====================================================================
+import unicodedata as _ud
+from datetime import datetime as _dt, timedelta as _td
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _TZ = _ZI("America/New_York")
+except Exception:          # pragma: no cover
+    _TZ = None
+
+MS_ID = os.environ.get("MS_CLIENT_ID", "")
+MS_SECRET = os.environ.get("MS_CLIENT_SECRET", "")
+MS_TENANT = os.environ.get("MS_TENANT", "consumers")   # OneDrive pessoal
+MS_REDIRECT = SERVICE_URL + "/ms/callback"
+MS_ESCOPO = "offline_access Files.Read.All User.Read"
+MS_LOGIN = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0"
+GRAPH = "https://graph.microsoft.com/v1.0"
+FIN_LINKS = {
+    "performance": os.environ.get("FIN_LINK_PERFORMANCE", ""),
+    "recebimentos": os.environ.get("FIN_LINK_RECEBIMENTOS", ""),
+    "vendas": os.environ.get("FIN_LINK_VENDAS", ""),
+}
+_ms_cache = {"access": None, "exp": 0}
+_ms_estado = {}
+_fin_cache = {"t": 0, "dados": None}
+_finqb_cache = {"t": 0, "dados": None}
+
+MESES_PT = ["", "JANEIRO", "FEVEREIRO", "MARCO", "ABRIL", "MAIO", "JUNHO", "JULHO",
+            "AGOSTO", "SETEMBRO", "OUTUBRO", "NOVEMBRO", "DEZEMBRO"]
+MESES_EN = ["", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP",
+            "OCT", "NOV", "DEC"]
+
+
+def _hoje_ny():
+    return (_dt.now(_TZ) if _TZ else _dt.utcnow() - _td(hours=4)).date()
+
+
+def _sem_acento(s):
+    s = _ud.normalize("NFKD", str(s or ""))
+    return "".join(c for c in s if not _ud.combining(c)).upper().strip()
+
+
+def so_financeiro(authorization):
+    email, papel, nome = quem_e(authorization)
+    if papel not in ("admin", "finance"):
+        raise HTTPException(403, "Só admin e financeiro veem o painel do financeiro.")
+    return email
+
+
+# ---------------------------------------------------------- login Microsoft
+def ms_ler():
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/ms_tokens",
+                     params={"id": "eq.1", "select": "*"},
+                     headers=qb_sb_headers(), timeout=30)
+    linhas = r.json() if r.ok else []
+    return linhas[0] if linhas else None
+
+
+def ms_gravar(refresh, conta=""):
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/ms_tokens",
+                      headers={**qb_sb_headers(), "Prefer": "resolution=merge-duplicates"},
+                      json={"id": 1, "refresh_token": refresh, "conta": conta},
+                      timeout=30)
+    if not r.ok:
+        raise HTTPException(500, "Não consegui salvar o login da Microsoft. A tabela "
+                                 "ms_tokens existe no Supabase? " + (r.text or "")[:200])
+
+
+def ms_token(codigo=None, refresh=None):
+    dados = {"client_id": MS_ID, "client_secret": MS_SECRET, "scope": MS_ESCOPO}
+    if codigo:
+        dados.update({"grant_type": "authorization_code", "code": codigo,
+                      "redirect_uri": MS_REDIRECT})
+    else:
+        dados.update({"grant_type": "refresh_token", "refresh_token": refresh})
+    r = requests.post(MS_LOGIN + "/token", data=dados, timeout=60)
+    if not r.ok:
+        corpo = (r.text or "")[:300]
+        log.warning("MS token erro %s | %s", r.status_code, corpo)
+        if "invalid_grant" in corpo:
+            raise HTTPException(428, "O login da Microsoft expirou. Abra /ms/connect de novo.")
+        raise HTTPException(502, "Microsoft recusou o login: " + corpo)
+    return r.json()
+
+
+def ms_acesso():
+    agora = time.time()
+    if _ms_cache["access"] and agora < _ms_cache["exp"]:
+        return _ms_cache["access"]
+    linha = ms_ler()
+    if not linha or not linha.get("refresh_token"):
+        raise HTTPException(428, "Microsoft não está conectada. Abra /ms/connect uma vez.")
+    j = ms_token(refresh=linha["refresh_token"])
+    if j.get("refresh_token") and j["refresh_token"] != linha["refresh_token"]:
+        ms_gravar(j["refresh_token"], linha.get("conta", ""))
+    _ms_cache.update({"access": j["access_token"],
+                      "exp": agora + max(60, int(j.get("expires_in") or 3600) - 300)})
+    return _ms_cache["access"]
+
+
+@app.get("/ms/connect")
+def ms_connect():
+    if not MS_ID or not SERVICE_URL:
+        raise HTTPException(500, "Faltam MS_CLIENT_ID / SERVICE_URL no Render.")
+    estado = _secrets.token_urlsafe(24)
+    _ms_estado[estado] = time.time()
+    for k in [k for k, v in _ms_estado.items() if time.time() - v > 900]:
+        _ms_estado.pop(k, None)
+    q = requests.utils.quote
+    return RedirectResponse(
+        MS_LOGIN + "/authorize?client_id=" + MS_ID + "&response_type=code"
+        "&redirect_uri=" + q(MS_REDIRECT, safe="") + "&response_mode=query"
+        "&scope=" + q(MS_ESCOPO, safe="") + "&state=" + estado + "&prompt=select_account")
+
+
+@app.get("/ms/callback")
+def ms_callback(code: str = "", state: str = "", error_description: str = ""):
+    if not code:
+        return HTMLResponse("<h3>Autorização cancelada.</h3><p>" +
+                            (error_description or "")[:300] + "</p>", status_code=400)
+    if not state or state not in _ms_estado:
+        return HTMLResponse("<h3>Pedido inválido</h3><p>Comece de novo em "
+                            "<a href='/ms/connect'>/ms/connect</a>.</p>", status_code=400)
+    _ms_estado.pop(state, None)
+    j = ms_token(codigo=code)
+    conta = ""
+    try:
+        me = requests.get(GRAPH + "/me", headers={"Authorization": "Bearer " + j["access_token"]},
+                          timeout=30).json()
+        conta = me.get("userPrincipalName") or me.get("mail") or ""
+    except Exception:
+        pass
+    ms_gravar(j.get("refresh_token"), conta)
+    _ms_cache.update({"access": None, "exp": 0})
+    return HTMLResponse("<div style='font-family:system-ui;padding:40px;text-align:center'>"
+                        "<h2>Microsoft conectada</h2><p>Conta " + conta +
+                        ". Pode fechar esta aba.</p></div>")
+
+
+@app.get("/ms/status")
+def ms_status():
+    linha = ms_ler()
+    if not linha:
+        return {"conectado": False, "motivo": "Rode o financeiro.sql no Supabase e abra /ms/connect."}
+    try:
+        ms_acesso()
+        return {"conectado": True, "conta": linha.get("conta", ""),
+                "links": {k: bool(v) for k, v in FIN_LINKS.items()}}
+    except HTTPException as e:
+        return {"conectado": False, "motivo": e.detail}
+
+
+# ---------------------------------------------------------- leitura das planilhas
+def _share_id(url):
+    return "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+
+
+def baixa_planilha(url):
+    tok = ms_acesso()
+    r = requests.get(f"{GRAPH}/shares/{_share_id(url)}/driveItem/content",
+                     headers={"Authorization": "Bearer " + tok,
+                              "Prefer": "redeemSharingLink"}, timeout=90)
+    if not r.ok:
+        raise HTTPException(502, f"OneDrive não entregou a planilha ({r.status_code}): "
+                                 + (r.text or "")[:200])
+    return r.content
+
+
+def _num(v):
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = str(v).replace("$", "").replace(",", "").replace("(", "-").replace(")", "").strip()
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _abre(conteudo):
+    from openpyxl import load_workbook
+    return load_workbook(io.BytesIO(conteudo), data_only=True, read_only=True)
+
+
+def _aba(wb, *nomes):
+    alvo = [_sem_acento(n) for n in nomes]
+    for ws in wb.worksheets:
+        if _sem_acento(ws.title) in alvo:
+            return ws
+    for ws in wb.worksheets:
+        t = _sem_acento(ws.title)
+        if any(a in t for a in alvo):
+            return ws
+    return None
+
+
+def le_tabelas_meta(ws):
+    """Na aba META_<MÊS>: todas as tabelas com colunas Target / Actual.
+
+    Cada tabela: {titulo, linhas:[{nome,target,actual,falta,pct}], total}.
+    O título é o texto da célula à esquerda de "Target" (vazio na primeira).
+    """
+    linhas = [list(r) for r in ws.iter_rows(min_row=1, max_row=250, max_col=12, values_only=True)]
+    tabelas, i = [], 0
+    while i < len(linhas):
+        r = linhas[i]
+        cab = [_sem_acento(c) for c in r]
+        if "TARGET" in cab and "ACTUAL" in cab:
+            ct = cab.index("TARGET")
+            cn = max(0, ct - 1)
+            tab = {"titulo": str(r[cn] or "").strip(), "linhas": [], "total": None}
+            j = i + 1
+            while j < len(linhas):
+                x = linhas[j]
+                nome = str(x[cn] or "").strip() if cn < len(x) else ""
+                cabx = [_sem_acento(c) for c in x]
+                if not nome or ("TARGET" in cabx and "ACTUAL" in cabx):
+                    break
+                lin = {"nome": nome.replace("\n", " "),
+                       "target": _num(x[ct] if ct < len(x) else None),
+                       "actual": _num(x[ct + 1] if ct + 1 < len(x) else None),
+                       "falta": _num(x[ct + 2] if ct + 2 < len(x) else None),
+                       "pct": _num(x[ct + 3] if ct + 3 < len(x) else None)}
+                if _sem_acento(nome) == "TOTAL":
+                    tab["total"] = lin
+                    j += 1
+                    break
+                tab["linhas"].append(lin)
+                j += 1
+            tabelas.append(tab)
+            i = j
+        else:
+            i += 1
+    return tabelas
+
+
+_MES_ABV_PT = {"JAN": 1, "FEV": 2, "MAR": 3, "ABR": 4, "MAI": 5, "JUN": 6, "JUL": 7,
+               "AGO": 8, "SET": 9, "OUT": 10, "NOV": 11, "DEZ": 12}
+
+
+def _dia_cab(v, ano):
+    """Cabeçalho de dia da aba Realizado: data de verdade ou texto '12-out'."""
+    if hasattr(v, "year") and hasattr(v, "month"):
+        return f"{v.year:04d}-{v.month:02d}-{v.day:02d}"
+    m = _re.match(r"^\s*(\d{1,2})\s*[-/ ]\s*([A-Za-zçÇ]{3})", str(v or ""))
+    if m and _sem_acento(m.group(2))[:3] in _MES_ABV_PT:
+        return f"{ano:04d}-{_MES_ABV_PT[_sem_acento(m.group(2))[:3]]:02d}-{int(m.group(1)):02d}"
+    return None
+
+
+def le_realizado(ws, ano):
+    """Aba "Realizado (PM's)": tabelas PM e VEND. com os dias da semana e o Total do mês."""
+    linhas = [list(r) for r in ws.iter_rows(min_row=1, max_row=200, max_col=60, values_only=True)]
+    tabelas = []
+    for i, r in enumerate(linhas):
+        cab = [_sem_acento(c) for c in r]
+        if "RESPONSAVEL" not in cab:
+            continue
+        cn = cab.index("RESPONSAVEL")
+        ct = cab.index("TOTAL") if "TOTAL" in cab else None
+        dias = {k: _dia_cab(v, ano) for k, v in enumerate(r) if k != cn and _dia_cab(v, ano)}
+        titulo = ""
+        for k in range(i - 1, max(-1, i - 4), -1):
+            t = str(linhas[k][cn] or "").strip() if cn < len(linhas[k]) else ""
+            if t:
+                titulo = t
+                break
+        tab = {"titulo": titulo, "linhas": []}
+        for x in linhas[i + 1:]:
+            nome = str(x[cn] or "").strip() if cn < len(x) else ""
+            if not nome:
+                break
+            tab["linhas"].append({"nome": nome,
+                                  "total": _num(x[ct]) if ct is not None and ct < len(x) else None,
+                                  "dias": {d: _num(x[k]) for k, d in dias.items() if k < len(x) and _num(x[k])}})
+        tabelas.append(tab)
+    return tabelas
+
+
+def le_vendas(ws, mes):
+    """Na aba 2026 do Controle Faturamento: o bloco do mês (Position | Oct | Goal | Sold...)."""
+    abv = MESES_EN[mes]
+    linhas = [list(r) for r in ws.iter_rows(min_row=1, max_row=400, max_col=12, values_only=True)]
+    for i, r in enumerate(linhas):
+        cab = [_sem_acento(c) for c in r]
+        if "POSITION" in cab and any(c[:3] == abv for c in cab if c):
+            cn = next(k for k, c in enumerate(cab) if c and c[:3] == abv)
+            col = {n: (cab.index(n) if n in cab else None)
+                   for n in ("GOAL", "SOLD", "TO REACH", "CLOSED CONTRACTS")}
+            pega = lambda x, n: _num(x[col[n]]) if col[n] is not None and col[n] < len(x) else None
+            out, total = [], None
+            for x in linhas[i + 1:]:
+                nome = str(x[cn] or "").strip() if cn < len(x) else ""
+                if not nome:
+                    break
+                lin = {"nome": nome, "meta": pega(x, "GOAL"), "vendido": pega(x, "SOLD"),
+                       "falta": pega(x, "TO REACH"), "contratos": pega(x, "CLOSED CONTRACTS")}
+                if _sem_acento(nome) == "TOTAL":
+                    total = lin
+                    break
+                out.append(lin)
+            return {"linhas": out, "total": total}
+    return None
+
+
+def fin_le_planilhas():
+    hoje = _hoje_ny()
+    erros, saida, baixadas = {}, {}, {}
+
+    def wb_de(chave):
+        url = FIN_LINKS.get(chave)
+        if not url:
+            raise HTTPException(500, f"Falta FIN_LINK_{chave.upper()} no Render.")
+        if url not in baixadas:
+            baixadas[url] = _abre(baixa_planilha(url))
+        return baixadas[url]
+
+    nome_meta = "META_" + MESES_PT[hoje.month]
+    for chave in ("performance", "recebimentos"):
+        try:
+            ws = _aba(wb_de(chave), nome_meta, "META_" + MESES_PT[hoje.month].replace("MARCO", "MARÇO"))
+            if ws is None:
+                raise HTTPException(404, f"Não achei a aba {nome_meta}.")
+            tabs = le_tabelas_meta(ws)
+            if chave == "performance":
+                saida["performance"] = tabs[0] if tabs else None
+            else:
+                pm = next((t for t in tabs if "PROJECT" in _sem_acento(t["titulo"])
+                           or _sem_acento(t["titulo"]) == "PM"), None)
+                outras = [t for t in tabs[1:] if t is not pm]
+                rec = {"pm": pm, "vendedores": outras[0] if outras else None, "aba": ws.title}
+                # A aba "Realizado (PM's)" traz o dia a dia da semana de cada PM e vendedor.
+                wr = _aba(wb_de(chave), "REALIZADO (PM'S)", "REALIZADO")
+                if wr is not None:
+                    rz = le_realizado(wr, hoje.year)
+                    rec["realizado"] = rz
+                    if not rec["vendedores"]:
+                        vt = next((t for t in rz if _sem_acento(t["titulo"]).startswith("VEND")), None)
+                        if vt:
+                            rec["vendedores"] = {"titulo": "Vendedores", "fonte": "Realizado",
+                                                 "linhas": [{"nome": l["nome"], "actual": l["total"],
+                                                             "target": None, "falta": None, "pct": None}
+                                                            for l in vt["linhas"]], "total": None}
+                saida["recebimentos"] = rec
+        except HTTPException as e:
+            erros[chave] = str(e.detail)
+        except Exception as e:
+            log.exception("financeiro %s", chave)
+            erros[chave] = "Erro lendo a planilha: " + str(e)[:200]
+    try:
+        ws = _aba(wb_de("vendas"), str(hoje.year))
+        if ws is None:
+            raise HTTPException(404, f"Não achei a aba {hoje.year}.")
+        saida["vendas"] = le_vendas(ws, hoje.month)
+    except HTTPException as e:
+        erros["vendas"] = str(e.detail)
+    except Exception as e:
+        log.exception("financeiro vendas")
+        erros["vendas"] = "Erro lendo a planilha: " + str(e)[:200]
+    return saida, erros
+
+
+def fin_grava_dia(dados):
+    dia = _hoje_ny().isoformat()
+    try:
+        requests.post(f"{SUPABASE_URL}/rest/v1/fin_diario",
+                      headers={**qb_sb_headers(), "Prefer": "resolution=merge-duplicates"},
+                      json={"dia": dia, "dados": dados, "atualizado": _dt.utcnow().isoformat() + "Z"},
+                      timeout=30)
+    except Exception as e:
+        log.warning("fin_diario: %s", e)
+
+
+def fin_historico(dias=45):
+    desde = (_hoje_ny() - _td(days=dias)).isoformat()
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/fin_diario",
+                     params={"dia": f"gte.{desde}", "select": "dia,dados,atualizado",
+                             "order": "dia.asc"},
+                     headers=qb_sb_headers(), timeout=30)
+    return r.json() if r.ok else []
+
+
+@app.get("/fin/planilhas")
+def fin_planilhas(authorization: str = Header(default=""), forcar: int = 0):
+    """Planilhas de hoje + as fotos dos dias anteriores."""
+    so_financeiro(authorization)
+    agora = time.time()
+    if forcar or not _fin_cache["dados"] or agora - _fin_cache["t"] > 300:
+        dados, erros = fin_le_planilhas()
+        if dados:
+            # junta com a foto de hoje já gravada, para uma planilha que falhou
+            # agora não apagar o que estava certo mais cedo
+            hist = {h["dia"]: h["dados"] for h in fin_historico(1)}
+            antes = hist.get(_hoje_ny().isoformat()) or {}
+            fin_grava_dia({**antes, **dados})
+        _fin_cache.update({"t": agora, "dados": {"erros": erros}})
+    return {"ok": True, "hoje": _hoje_ny().isoformat(), "erros": _fin_cache["dados"]["erros"],
+            "historico": fin_historico()}
+
+
+# ---------------------------------------------------------- QuickBooks: contas a pagar e saldo
+@app.get("/fin/qb")
+def fin_qb(authorization: str = Header(default=""), forcar: int = 0):
+    so_financeiro(authorization)
+    agora = time.time()
+    if not forcar and _finqb_cache["dados"] and agora - _finqb_cache["t"] < 300:
+        return _finqb_cache["dados"]
+    contas, pagar, erros = [], [], {}
+    try:
+        for a in (qb_query("select Id, Name, AccountType, CurrentBalance, Active from Account "
+                           "where AccountType = 'Bank' maxresults 200").get("Account") or []):
+            if a.get("Active") is False:
+                continue
+            contas.append({"nome": a.get("Name"), "saldo": round(float(a.get("CurrentBalance") or 0), 2)})
+    except HTTPException as e:
+        erros["saldo"] = str(e.detail)
+    try:
+        pos = 1
+        for _ in range(5):
+            lote = qb_query("select Id, DocNumber, VendorRef, TxnDate, DueDate, Balance from Bill "
+                            f"where Balance > '0' startposition {pos} maxresults 1000").get("Bill") or []
+            for b in lote:
+                pagar.append({"fornecedor": (b.get("VendorRef") or {}).get("name", ""),
+                              "num": b.get("DocNumber") or "", "data": b.get("TxnDate"),
+                              "vence": b.get("DueDate") or b.get("TxnDate"),
+                              "saldo": round(float(b.get("Balance") or 0), 2)})
+            if len(lote) < 1000:
+                break
+            pos += 1000
+    except HTTPException as e:
+        erros["pagar"] = str(e.detail)
+    out = {"ok": True, "contas": contas, "saldo": round(sum(c["saldo"] for c in contas), 2),
+           "pagar": pagar, "erros": erros}
+    _finqb_cache.update({"t": agora, "dados": out})
+    return out
