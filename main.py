@@ -2577,8 +2577,9 @@ def le_tabelas_meta(ws):
     while i < len(linhas):
         r = linhas[i]
         cab = [_sem_acento(c) for c in r]
-        if "TARGET" in cab and "ACTUAL" in cab:
-            ct = cab.index("TARGET")
+        # "Target" ou "Target (Down Payment)": basta começar com TARGET
+        if any(c.startswith("TARGET") for c in cab) and any(c.startswith("ACTUAL") for c in cab):
+            ct = next(k for k, c in enumerate(cab) if c.startswith("TARGET"))
             cn = max(0, ct - 1)
             tab = {"titulo": str(r[cn] or "").strip(), "linhas": [], "total": None}
             j = i + 1
@@ -2586,7 +2587,7 @@ def le_tabelas_meta(ws):
                 x = linhas[j]
                 nome = str(x[cn] or "").strip() if cn < len(x) else ""
                 cabx = [_sem_acento(c) for c in x]
-                if not nome or ("TARGET" in cabx and "ACTUAL" in cabx):
+                if not nome or (any(c.startswith("TARGET") for c in cabx) and any(c.startswith("ACTUAL") for c in cabx)):
                     break
                 lin = {"nome": nome.replace("\n", " "),
                        "target": _num(x[ct] if ct < len(x) else None),
@@ -2663,6 +2664,9 @@ def le_vendas(ws, mes):
             out, total = [], None
             for x in linhas[i + 1:]:
                 nome = str(x[cn] or "").strip() if cn < len(x) else ""
+                # a linha TOTAL costuma ter A e B mescladas: o texto fica na coluna A
+                if not nome and cn > 0 and _sem_acento(x[cn - 1]) == "TOTAL":
+                    nome = "TOTAL"
                 if not nome:
                     break
                 lin = {"nome": nome, "meta": pega(x, "GOAL"), "vendido": pega(x, "SOLD"),
