@@ -2488,15 +2488,54 @@ def _share_id(url):
     return "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
 
 
+def _links_candidatos(url):
+    """O OneDrive tem vários formatos de link. A Graph aceita bem o link curto
+    (1drv.ms/x/c/...); o link comprido do navegador traz o curto escondido no
+    parâmetro redeem= (em base64). Tenta nessa ordem."""
+    from urllib.parse import urlparse, parse_qs
+    out = []
+    try:
+        red = (parse_qs(urlparse(url).query).get("redeem") or [""])[0]
+        if red:
+            out.append(base64.urlsafe_b64decode(red + "=" * (-len(red) % 4)).decode())
+    except Exception:
+        pass
+    out.append(url)
+    if "?" in url:
+        out.append(url.split("?")[0])
+    vistos = []
+    for u in out:
+        if u and u not in vistos:
+            vistos.append(u)
+    return vistos
+
+
+def _erro_curto(r):
+    try:
+        e = (r.json() or {}).get("error") or {}
+        msg = str(e.get("message") or "")
+        if "<" in msg:
+            msg = ""
+        return (str(e.get("code") or "") + (" — " + msg if msg else "")).strip(" —")
+    except Exception:
+        return (r.text or "")[:120]
+
+
 def baixa_planilha(url):
     tok = ms_acesso()
-    r = requests.get(f"{GRAPH}/shares/{_share_id(url)}/driveItem/content",
-                     headers={"Authorization": "Bearer " + tok,
-                              "Prefer": "redeemSharingLink"}, timeout=90)
-    if not r.ok:
-        raise HTTPException(502, f"OneDrive não entregou a planilha ({r.status_code}): "
-                                 + (r.text or "")[:200])
-    return r.content
+    ultimo = ""
+    for u in _links_candidatos(url):
+        r = requests.get(f"{GRAPH}/shares/{_share_id(u)}/driveItem/content",
+                         headers={"Authorization": "Bearer " + tok,
+                                  "Prefer": "redeemSharingLink"}, timeout=90)
+        if r.ok:
+            return r.content
+        ultimo = f"{r.status_code} {_erro_curto(r)}"
+        log.warning("OneDrive %s para %s", ultimo, u[:60])
+    if ultimo.startswith(("401", "403")):
+        raise HTTPException(502, "A conta Microsoft conectada não tem acesso a esta planilha "
+                                 "(abra o link com essa conta uma vez, ou compartilhe com ela). " + ultimo)
+    raise HTTPException(502, "OneDrive não entregou a planilha: " + ultimo)
 
 
 def _num(v):
