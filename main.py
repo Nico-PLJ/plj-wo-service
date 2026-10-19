@@ -2374,9 +2374,8 @@ def _sem_acento(s):
 
 
 def so_financeiro(authorization):
+    # Liberado para todo usuário cadastrado no schedule (tabela app_users).
     email, papel, nome = quem_e(authorization)
-    if papel not in ("admin", "finance"):
-        raise HTTPException(403, "Só admin e financeiro veem o painel do financeiro.")
     return email
 
 
