@@ -2088,6 +2088,18 @@ def _classifica(memo, inteiro):
     return False
 
 
+def _eh_full(memo):
+    """Full payment de verdade: "full" na DESCRIÇÃO da fatura.
+
+    O memo do cliente traz depois o bloco padrão "payment options: ..."
+    que fala em pagar "in full" — na primeira versão isso marcava quase
+    toda fatura como full e derrubou o recebido dos PMs. Agora só vale o
+    trecho antes de "payment options".
+    """
+    m = (memo or "").lower().split("payment option")[0]
+    return bool(_re.search(r"\bfull\b", m))
+
+
 def _eh_entrada(texto):
     """Mantida para quem chama com um texto só."""
     return _classifica(texto, texto)
@@ -2097,7 +2109,7 @@ def qb_faturas_por_id(ids):
     """Busca faturas pelo Id, em lotes, guardando o que já foi lido."""
     # "full" entrou depois: entrada antiga no cache sem essa chave é relida
     faltam = [i for i in ids if i and (i not in _inv_cache
-              or ("full" not in _inv_cache[i]
+              or (_inv_cache[i].get("fv") != 2
                   and not _inv_cache[i].get("desconhecida")))]
     for k in range(0, len(faltam), 40):
         lote = faltam[k:k + 40]
@@ -2115,7 +2127,7 @@ def qb_faturas_por_id(ids):
                 "entrada": _classifica(memo, inteiro),
                 # Full payment: o app conta metade para o PM quando o
                 # pagamento entra depois de a obra começar (extras)
-                "full": ("full" in (memo or inteiro)),
+                "full": _eh_full(memo), "fv": 2,
                 "doc": inv.get("DocNumber") or "",
             }
         # Fatura que o QuickBooks não devolveu fica marcada como
@@ -2155,7 +2167,7 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
     total do PM, mesmo quando divididas em várias parcelas — a decisão
     é tomada na FATURA, então todas as partes dela caem junto.
     """
-    chave = "v4:" + str(ini) + ".." + str(fim)      # v4: lista dos full payments
+    chave = "v5:" + str(ini) + ".." + str(fim)      # v5: full só pela descrição
     guardado = _rec_cache.get(chave)
     if guardado and (time.time() - guardado["quando"]) < 600 and not detalhado:
         return guardado["dados"]
@@ -2271,6 +2283,7 @@ def qb_recebido(ini: str = "", fim: str = "",
             "total": round(sum(d["recebido"] for d in lista), 2),
             "entradas": round(sum(d.get("entrada", 0) for d in lista), 2),
             "nao_lidas": round(sum(d.get("desconhecido", 0) for d in lista), 2),
+            "fulls_v": 2,
             "projetos": lista}
 
 
