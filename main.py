@@ -2095,7 +2095,10 @@ def _eh_entrada(texto):
 
 def qb_faturas_por_id(ids):
     """Busca faturas pelo Id, em lotes, guardando o que já foi lido."""
-    faltam = [i for i in ids if i and i not in _inv_cache]
+    # "full" entrou depois: entrada antiga no cache sem essa chave é relida
+    faltam = [i for i in ids if i and (i not in _inv_cache
+              or ("full" not in _inv_cache[i]
+                  and not _inv_cache[i].get("desconhecida")))]
     for k in range(0, len(faltam), 40):
         lote = faltam[k:k + 40]
         lista = "','".join(_esc_sql(str(x)) for x in lote)
@@ -2110,6 +2113,9 @@ def qb_faturas_por_id(ids):
             _inv_cache[str(inv.get("Id"))] = {
                 "texto": (memo or inteiro),
                 "entrada": _classifica(memo, inteiro),
+                # Full payment: o app conta metade para o PM quando o
+                # pagamento entra depois de a obra começar (extras)
+                "full": ("full" in (memo or inteiro)),
                 "doc": inv.get("DocNumber") or "",
             }
         # Fatura que o QuickBooks não devolveu fica marcada como
@@ -2149,7 +2155,7 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
     total do PM, mesmo quando divididas em várias parcelas — a decisão
     é tomada na FATURA, então todas as partes dela caem junto.
     """
-    chave = "v3:" + str(ini) + ".." + str(fim)      # v3: precedência de "down"
+    chave = "v4:" + str(ini) + ".." + str(fim)      # v4: lista dos full payments
     guardado = _rec_cache.get(chave)
     if guardado and (time.time() - guardado["quando"]) < 600 and not detalhado:
         return guardado["dados"]
@@ -2184,7 +2190,7 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
                                   "id": ref.get("value") or "",
                                   "recebido": 0.0, "qtd": 0,
                                   "entrada": 0.0, "semfatura": 0.0,
-                                  "desconhecido": 0.0})
+                                  "desconhecido": 0.0, "fulls": []})
         partes = _linhas_do_pagamento(p)
         # Adiantamento sem fatura amarrada: entrou no caixa mas não
         # abateu nada. Nunca contou e continua não contando.
@@ -2209,6 +2215,14 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
                 d["recebido"] += val
                 d["qtd"] += 1
                 classe = "conta"
+            # Cada parte de full payment vai listada com a data: o app
+            # compara com o início da obra no schedule e, se já tinha
+            # começado, conta só metade para o PM.
+            if fid and inf.get("full") and classe in ("conta", "down payment"):
+                d["fulls"].append({"data": p.get("TxnDate") or "",
+                                   "valor": round(val, 2),
+                                   "fatura": inf.get("doc") or fid,
+                                   "contou": classe == "conta"})
             if detalhado:
                 linhas.append({
                     "projeto": nome,
