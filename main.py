@@ -2711,6 +2711,80 @@ def le_vendas(ws, mes):
     return None
 
 
+def qb_pl_mes(metodo="Cash"):
+    """P&L do mês corrente até hoje, direto do QuickBooks.
+
+    Devolve entrada (Income), custo dos materiais/mão de obra (COGS),
+    custo operacional (Expenses) e Net Income.
+    """
+    hoje = _hoje_ny()
+    rel = qb_get("reports/ProfitAndLoss",
+                 {"start_date": hoje.replace(day=1).isoformat(),
+                  "end_date": hoje.isoformat(),
+                  "accounting_method": metodo})
+    n = len((rel.get("Columns") or {}).get("Column") or []) or 2
+    linhas = (rel.get("Rows") or {}).get("Row") or []
+
+    def total(grupo):
+        v = _pl_por_coluna(linhas, grupo, n)
+        return round(v[-1], 2) if v else 0.0
+    entrada, cogs, desp = total("Income"), total("COGS"), total("Expenses")
+    liq = _pl_por_coluna(linhas, "NetIncome", n)
+    liq = round(liq[-1], 2) if liq else round(entrada - cogs - desp, 2)
+    return {"entrada": entrada, "cogs": cogs, "operacional": desp,
+            "net": liq, "metodo": metodo}
+
+
+FIN_PL_METODO = os.environ.get("FIN_PL_METODO", "Cash")
+
+
+def fin_performance_qb(alvo):
+    """Troca o "Actual" da tabela de Performance pelo número do QuickBooks.
+
+    A META continua vindo da planilha (muda uma vez por mês). Se a planilha
+    não abrir, usa a meta da última foto guardada. O realizado vem sempre
+    do QuickBooks, então não depende mais de alguém atualizar a planilha.
+    """
+    pl = qb_pl_mes(FIN_PL_METODO)
+    if not alvo or not alvo.get("linhas"):
+        alvo = {"titulo": "", "total": None, "linhas": [
+            {"nome": "Entrada", "target": None}, {"nome": "Cost of Goods Sold", "target": None},
+            {"nome": "Custo Operacional", "target": None}, {"nome": "Net Income", "target": None}]}
+    linhas = []
+    for l in alvo["linhas"]:
+        n = _sem_acento(l.get("nome"))
+        if "ENTRADA" in n or "INCOME" == n or "REVENUE" in n:
+            a = pl["entrada"]
+        elif "GOODS" in n or "COGS" in n:
+            a = pl["cogs"]
+        elif "OPERACIONAL" in n or "EXPENSE" in n:
+            a = pl["operacional"]
+        elif "NET" in n or "LUCRO" in n:
+            a = pl["net"]
+        else:
+            linhas.append(l)
+            continue
+        t = l.get("target")
+        eh_entrada = "ENTRADA" in n or "REVENUE" in n or n == "INCOME"
+        linhas.append({"nome": l.get("nome"), "target": t, "actual": a,
+                       "falta": (round(t - a, 2) if t is not None else None),
+                       "pct": (None if eh_entrada or not pl["entrada"]
+                               else round(a / pl["entrada"], 4))})
+    return {"titulo": alvo.get("titulo", ""), "total": None, "linhas": linhas,
+            "fonte": "QuickBooks", "metodo": pl["metodo"],
+            "atualizado": _dt.utcnow().isoformat() + "Z"}
+
+
+def fin_meta_guardada():
+    """Metas da última foto que tem Performance (para quando a planilha falha)."""
+    for h in reversed(fin_historico(40)):
+        p = (h.get("dados") or {}).get("performance")
+        if p and p.get("linhas"):
+            return {"titulo": p.get("titulo", ""), "linhas": [
+                {"nome": x.get("nome"), "target": x.get("target")} for x in p["linhas"]]}
+    return None
+
+
 def fin_le_planilhas():
     hoje = _hoje_ny()
     erros, saida, baixadas = {}, {}, {}
@@ -2731,7 +2805,7 @@ def fin_le_planilhas():
                 raise HTTPException(404, f"Não achei a aba {nome_meta}.")
             tabs = le_tabelas_meta(ws)
             if chave == "performance":
-                saida["performance"] = tabs[0] if tabs else None
+                saida["performance"] = tabs[0] if tabs else None   # só a META; o realizado vem do QB abaixo
             else:
                 pm = next((t for t in tabs if "PROJECT" in _sem_acento(t["titulo"])
                            or _sem_acento(t["titulo"]) == "PM"), None)
@@ -2755,6 +2829,16 @@ def fin_le_planilhas():
         except Exception as e:
             log.exception("financeiro %s", chave)
             erros[chave] = "Erro lendo a planilha: " + str(e)[:200]
+    # Performance: realizado do QuickBooks, meta da planilha (ou da última foto)
+    try:
+        meta = saida.get("performance") or fin_meta_guardada()
+        saida["performance"] = fin_performance_qb(meta)
+        erros.pop("performance", None)
+    except HTTPException as e:
+        erros["performance"] = "QuickBooks: " + str(e.detail)
+    except Exception as e:
+        log.exception("financeiro performance qb")
+        erros["performance"] = "QuickBooks: " + str(e)[:200]
     try:
         ws = _aba(wb_de("vendas"), str(hoje.year))
         if ws is None:
@@ -2804,6 +2888,14 @@ def fin_planilhas(authorization: str = Header(default=""), forcar: int = 0):
         _fin_cache.update({"t": agora, "dados": {"erros": erros}})
     return {"ok": True, "hoje": _hoje_ny().isoformat(), "erros": _fin_cache["dados"]["erros"],
             "historico": fin_historico()}
+
+
+@app.get("/fin/pl")
+def fin_pl(authorization: str = Header(default="")):
+    """Para conferir: P&L do mês pelo regime de caixa e de competência."""
+    so_financeiro(authorization)
+    return {"ok": True, "cash": qb_pl_mes("Cash"), "accrual": qb_pl_mes("Accrual"),
+            "usado": FIN_PL_METODO}
 
 
 # ---------------------------------------------------------- QuickBooks: contas a pagar e saldo
