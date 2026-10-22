@@ -2729,10 +2729,20 @@ def qb_pl_mes(metodo="Cash"):
         v = _pl_por_coluna(linhas, grupo, n)
         return round(v[-1], 2) if v else 0.0
     entrada, cogs, desp = total("Income"), total("COGS"), total("Expenses")
-    liq = _pl_por_coluna(linhas, "NetIncome", n)
-    liq = round(liq[-1], 2) if liq else round(entrada - cogs - desp, 2)
+    liq_qb = _pl_por_coluna(linhas, "NetIncome", n)
+    liq_qb = round(liq_qb[-1], 2) if liq_qb else None
+    # Net Income do painel = Entrada - COGS - Custo Operacional, a mesma
+    # conta da planilha. O "Net Income" do QuickBooks também desconta
+    # Other Income/Other Expenses (ex.: -$175k em outubro), que a planilha
+    # não considera — por isso vinha bem diferente.
+    # Net Income do painel = Net Operating Income do QuickBooks
+    # (Income - COGS - Expenses, sem Other Income/Expenses).
+    noi = _pl_por_coluna(linhas, "NetOperatingIncome", n)
+    liq = round(noi[-1], 2) if noi else round(entrada - cogs - desp, 2)
     return {"entrada": entrada, "cogs": cogs, "operacional": desp,
-            "net": liq, "metodo": metodo}
+            "net": liq, "net_qb": liq_qb,
+            "outros": (round(liq_qb - liq, 2) if liq_qb is not None else None),
+            "metodo": metodo}
 
 
 FIN_PL_METODO = os.environ.get("FIN_PL_METODO", "Cash")
