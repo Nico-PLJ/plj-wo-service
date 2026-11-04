@@ -1568,10 +1568,11 @@ def qb_custo_horas(desde):
         except (TypeError, ValueError):
             return 0.0
     taxa = {}
-    for e in todos("select Id, CostRate from Employee"):
+    # CostRate não pode ir no SELECT (o QuickBooks devolve QueryProcessingError)
+    for e in todos("select * from Employee"):
         taxa["E" + str(e.get("Id"))] = f(e.get("CostRate"))
     try:
-        for v in todos("select Id, CostRate from Vendor"):
+        for v in todos("select * from Vendor"):
             taxa["V" + str(v.get("Id"))] = f(v.get("CostRate"))
     except HTTPException:
         pass
