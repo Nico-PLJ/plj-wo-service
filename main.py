@@ -1616,6 +1616,125 @@ def fin_obras(authorization: str = Header(default=""), forcar: int = 0):
             "atualizado": _dt.utcfromtimestamp(_obras_cache["t"]).isoformat() + "Z"}
 
 
+_PREV_RX = _re.compile(r"^\s*([A-Za-z][A-Za-z0-9 &/.'()+-]*?)\s*[-–:=]\s*\$?\s*(-?[\d,]+(?:\.\d+)?)\s*(?:[-–]\s*(-?[\d.,]+)\s*%)?\s*$")
+
+
+def parse_previsao(txt):
+    """Nota de previsão da Luisa no JobNimbus, uma linha por item:
+
+        Barn - 13,798.41
+        Labor - 10,000.00
+        ...
+        Cost - 28,530.83
+        Estimate - 53,000.00
+        Profit - 24,469.17 - 46%
+
+    Devolve None se a nota não tiver Cost e Estimate (não é previsão).
+    """
+    itens, cost, est, profit, pct = [], None, None, None, None
+    txt = _re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", str(txt or ""))
+    for ln in txt.replace("\r", "").split("\n"):
+        ln = _re.sub(r"<[^>]+>", " ", ln).replace("&nbsp;", " ").strip()
+        m = _PREV_RX.match(ln)
+        if not m:
+            continue
+        nome = m.group(1).strip()
+        try:
+            val = float(m.group(2).replace(",", ""))
+        except ValueError:
+            continue
+        n = nome.lower()
+        if n in ("cost", "costs", "total cost"):
+            cost = val
+        elif n in ("estimate", "estimated", "contract", "price"):
+            est = val
+        elif n.startswith("profit"):
+            profit = val
+            if m.group(3):
+                try:
+                    pct = float(m.group(3).replace(",", "."))
+                except ValueError:
+                    pass
+        else:
+            itens.append({"nome": nome, "valor": val})
+    if cost is None or est is None:
+        return None
+    if profit is None:
+        profit = est - cost
+    if pct is None and est:
+        pct = round(100 * profit / est, 1)
+    return {"itens": itens, "custo": cost, "estimate": est, "lucro": profit, "pct": pct}
+
+
+_prev_cache = {"t": 0, "dados": None}
+
+
+@app.get("/jn/previsoes")
+def jn_previsoes(authorization: str = Header(default=""), forcar: int = 0):
+    """Previsão de gastos de cada job (a nota com Cost / Estimate / Profit).
+
+    Vale a nota mais recente de cada job. Vem com o endereço do job para o
+    painel ligar ao card do schedule.
+    """
+    quem_e(authorization)
+    agora = time.time()
+    if not forcar and _prev_cache["dados"] and agora - _prev_cache["t"] < 900:
+        return _prev_cache["dados"]
+    desde = int(time.mktime(_date(2025, 1, 1).timetuple()))
+    flt = json.dumps({"must": [{"term": {"record_type_name": "Note"}},
+                               {"range": {"date_created": {"gte": desde}}}]})
+    por_job, inicio = {}, 0
+    for _ in range(40):
+        r = requests.get(f"{JN_BASE}/activities", headers=jn_headers(),
+                         params={"filter": flt, "size": 1000, "from": inicio},
+                         timeout=90)
+        if not r.ok:
+            raise HTTPException(502, f"JobNimbus falhou ({r.status_code}): {r.text[:200]}")
+        corpo = r.json() or {}
+        lote = corpo.get("activity") or corpo.get("results") or []
+        for a in lote:
+            txt = str(a.get("note") or "")
+            if "estimate" not in txt.lower() or "cost" not in txt.lower():
+                continue
+            pv = parse_previsao(txt)
+            if not pv:
+                continue
+            prim = a.get("primary") or {}
+            jid = str(prim.get("id") or "")
+            if not jid:
+                continue
+            quando = float(a.get("date_created") or 0)
+            if jid in por_job and por_job[jid]["quando"] >= quando:
+                continue
+            por_job[jid] = {"job_id": jid, "job": prim.get("name") or "",
+                            "por": a.get("created_by_name") or "", "quando": quando, **pv}
+        inicio += len(lote)
+        if not lote or inicio >= int(corpo.get("count") or 0):
+            break
+    # endereço de cada job, para casar com o card do schedule
+    if por_job:
+        campos = "jnid,address_line1,city,state_text"
+        ini = 0
+        for _ in range(40):
+            r = requests.get(f"{JN_BASE}/jobs", headers=jn_headers(),
+                             params={"size": 1000, "from": ini, "fields": campos}, timeout=60)
+            if not r.ok:
+                break
+            corpo = r.json() or {}
+            lote = corpo.get("results") or []
+            for j in lote:
+                d = por_job.get(str(j.get("jnid") or ""))
+                if d:
+                    d["endereco"] = ", ".join(x for x in [str(j.get("address_line1") or "").strip(),
+                                                         str(j.get("city") or "").strip()] if x)
+            ini += len(lote)
+            if not lote or ini >= int(corpo.get("count") or 0):
+                break
+    dados = {"ok": True, "qtd": len(por_job), "previsoes": list(por_job.values())}
+    _prev_cache.update(t=agora, dados=dados)
+    return dados
+
+
 @app.get("/jn/notas")
 def jn_notas(authorization: str = Header(default=""), q: str = "", size: int = 100):
     """Notas recentes do JobNimbus (para achar o formato da previsão da Luisa).
