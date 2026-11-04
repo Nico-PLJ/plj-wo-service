@@ -1521,8 +1521,87 @@ def qb_custos_por_projeto():
             for proj, nm in partes:
                 projetos.update(proj)
                 nomes |= nm
+    # Mão de obra = "Hourly time cost" do projeto no QuickBooks: horas lançadas
+    # (TimeActivity) x custo por hora de cada funcionário. Isso não aparece no
+    # P&L do projeto, por isso vem à parte.
+    horas_err = ""
+    try:
+        por_cli = qb_custo_horas(OBRAS_DESDE)
+    except HTTPException as e:
+        por_cli, horas_err = {}, str(e.detail)
+    por_id = {p["id"]: p for p in projetos.values() if p.get("id")}
+    for cid, h in por_cli.items():
+        p = por_id.get(cid)
+        if not p:
+            p = {"projeto": h["nome"], "id": cid, "receita": 0.0, "custos": {}}
+            projetos[h["nome"] + "#" + cid] = p
+            por_id[cid] = p
+        p["custos"]["Hourly time cost"] = round(h["custo"], 2)
+        p["horas"] = round(h["horas"], 2)
+        p["horas_det"] = h["por_pessoa"]
+    nomes.add("Hourly time cost")
     return {"projetos": list(projetos.values()), "contas_custo": sorted(nomes),
-            "desde": OBRAS_DESDE, "clientes": len(ids)}
+            "desde": OBRAS_DESDE, "clientes": len(ids), "horas_erro": horas_err}
+
+
+def qb_custo_horas(desde):
+    """Custo das horas lançadas por projeto: soma de horas x custo/hora da pessoa.
+
+    Usa o custo/hora gravado no próprio lançamento quando existe (CostRate) e,
+    se não, o custo/hora do cadastro do funcionário (ou do fornecedor).
+    """
+    def todos(sql_base):
+        out, pos = [], 1
+        for _ in range(60):
+            lote = qb_query(sql_base + " startposition " + str(pos) + " maxresults 1000")
+            chave = next((k for k in lote if isinstance(lote.get(k), list)), None)
+            itens = lote.get(chave) or [] if chave else []
+            out += itens
+            if len(itens) < 1000:
+                break
+            pos += 1000
+        return out
+
+    def f(v):
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    taxa = {}
+    for e in todos("select Id, CostRate from Employee"):
+        taxa["E" + str(e.get("Id"))] = f(e.get("CostRate"))
+    try:
+        for v in todos("select Id, CostRate from Vendor"):
+            taxa["V" + str(v.get("Id"))] = f(v.get("CostRate"))
+    except HTTPException:
+        pass
+    por = {}
+    for t in todos("select * from TimeActivity where TxnDate >= '" + _esc_sql(desde) + "'"):
+        cli = t.get("CustomerRef") or {}
+        cid = str(cli.get("value") or "")
+        if not cid:
+            continue
+        horas = f(t.get("Hours")) + f(t.get("Minutes")) / 60.0
+        if not horas and t.get("StartTime") and t.get("EndTime"):
+            try:
+                ini = _dt.fromisoformat(str(t["StartTime"])[:19])
+                fim = _dt.fromisoformat(str(t["EndTime"])[:19])
+                horas = max(0.0, (fim - ini).total_seconds() / 3600.0
+                            - f(t.get("BreakHours")) - f(t.get("BreakMinutes")) / 60.0)
+            except ValueError:
+                horas = 0.0
+        if (t.get("NameOf") or "") == "Vendor":
+            pref, ref = "V", t.get("VendorRef") or {}
+        else:
+            pref, ref = "E", t.get("EmployeeRef") or {}
+        rate = f(t.get("CostRate")) or taxa.get(pref + str(ref.get("value") or ""), 0.0)
+        d = por.setdefault(cid, {"nome": cli.get("name") or "", "horas": 0.0,
+                                 "custo": 0.0, "por_pessoa": {}})
+        d["horas"] += horas
+        d["custo"] += horas * rate
+        nome = ref.get("name") or "?"
+        d["por_pessoa"][nome] = round(d["por_pessoa"].get(nome, 0.0) + horas * rate, 2)
+    return por
 
 
 @app.get("/fin/obras")
