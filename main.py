@@ -1427,18 +1427,8 @@ def qb_margens():
 _obras_cache = {"t": 0, "dados": None}
 
 
-def qb_custos_por_projeto():
-    """P&L de todos os projetos (desde 2015, competência), quebrado por CONTA.
-
-    Uma chamada só (summarize_column_by=Customers). Para cada projeto devolve
-    a receita e o valor de cada conta de custo (COGS e despesas), para o
-    painel separar mão de obra, material, subcontrato e o resto.
-    """
-    rel = qb_get("reports/ProfitAndLoss",
-                 {"summarize_column_by": "Customers",
-                  "start_date": "2015-01-01",
-                  "end_date": _date.today().isoformat(),
-                  "accounting_method": "Accrual"})
+def _pl_obras_parse(rel):
+    """Lê um P&L quebrado por cliente e devolve {projeto: {id, receita, custos{conta: valor}}}."""
     cols = (rel.get("Columns") or {}).get("Column") or []
     titulos, ids = [], []
     for c in cols:
@@ -1474,9 +1464,7 @@ def qb_custos_por_projeto():
                 if any(vals[1:]):
                     contas.append((gr, (cd[0].get("value") if cd else "") or "", vals))
     varre((rel.get("Rows") or {}).get("Row") or [], "")
-
-    nomes_custo = sorted({c[1] for c in contas if c[0] in ("COGS", "Expenses", "OtherExpenses")})
-    projetos = []
+    saida, nomes = {}, set()
     for i in range(1, n):
         t = titulos[i]
         if not t or t.lower() == "total":
@@ -1486,11 +1474,55 @@ def qb_custos_por_projeto():
         for g, nome, vals in contas:
             if g in ("COGS", "Expenses", "OtherExpenses") and vals[i]:
                 custos[nome] = round(custos.get(nome, 0.0) + vals[i], 2)
-        if not receita and not custos:
-            continue
-        projetos.append({"projeto": t, "id": ids[i], "receita": round(receita, 2),
-                         "custos": custos})
-    return {"projetos": projetos, "contas_custo": nomes_custo}
+                nomes.add(nome)
+        if receita or custos:
+            saida[t] = {"projeto": t, "id": ids[i], "receita": round(receita, 2), "custos": custos}
+    return saida, nomes
+
+
+OBRAS_DESDE = os.environ.get("OBRAS_DESDE", "2025-01-01")
+
+
+def qb_custos_por_projeto():
+    """Custo e receita de cada projeto, por conta, desde OBRAS_DESDE (competência).
+
+    O P&L de todos os clientes de uma vez é grande demais para o QuickBooks
+    ("Report too large"). Então pede em lotes de clientes; um lote que ainda
+    for grande é dividido ao meio até caber.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    ids, pos = [], 1
+    for _ in range(30):
+        lote = qb_query("select Id from Customer startposition " + str(pos) +
+                        " maxresults 1000").get("Customer") or []
+        ids += [str(c.get("Id")) for c in lote if c.get("Id")]
+        if len(lote) < 1000:
+            break
+        pos += 1000
+    qb_acesso()                       # renova o token antes das chamadas em paralelo
+    hoje = _date.today().isoformat()
+
+    def pede(grupo):
+        try:
+            rel = qb_get("reports/ProfitAndLoss",
+                         {"summarize_column_by": "Customers", "customer": ",".join(grupo),
+                          "start_date": OBRAS_DESDE, "end_date": hoje,
+                          "accounting_method": "Accrual"})
+            return [_pl_obras_parse(rel)]
+        except HTTPException as e:
+            if ("too large" in str(e.detail).lower() or "10100" in str(e.detail)) and len(grupo) > 1:
+                m = len(grupo) // 2
+                return pede(grupo[:m]) + pede(grupo[m:])
+            raise
+    lotes = [ids[i:i + 60] for i in range(0, len(ids), 60)]
+    projetos, nomes = {}, set()
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for partes in ex.map(pede, lotes):
+            for proj, nm in partes:
+                projetos.update(proj)
+                nomes |= nm
+    return {"projetos": list(projetos.values()), "contas_custo": sorted(nomes),
+            "desde": OBRAS_DESDE, "clientes": len(ids)}
 
 
 @app.get("/fin/obras")
