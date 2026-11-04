@@ -1424,6 +1424,112 @@ def qb_margens():
     return saida
 
 
+_obras_cache = {"t": 0, "dados": None}
+
+
+def qb_custos_por_projeto():
+    """P&L de todos os projetos (desde 2015, competência), quebrado por CONTA.
+
+    Uma chamada só (summarize_column_by=Customers). Para cada projeto devolve
+    a receita e o valor de cada conta de custo (COGS e despesas), para o
+    painel separar mão de obra, material, subcontrato e o resto.
+    """
+    rel = qb_get("reports/ProfitAndLoss",
+                 {"summarize_column_by": "Customers",
+                  "start_date": "2015-01-01",
+                  "end_date": _date.today().isoformat(),
+                  "accounting_method": "Accrual"})
+    cols = (rel.get("Columns") or {}).get("Column") or []
+    titulos, ids = [], []
+    for c in cols:
+        titulos.append(c.get("ColTitle") or "")
+        meta = {m.get("Name"): m.get("Value") for m in (c.get("MetaData") or [])}
+        ids.append(meta.get("ColKey") or "")
+    n = len(titulos)
+
+    def num(v):
+        try:
+            return float(str(v or 0).replace(",", ""))
+        except ValueError:
+            return 0.0
+    contas = []          # (grupo, nome da conta, [valores por coluna])
+
+    def varre(rows, grupo):
+        for r in (rows or []):
+            g = r.get("group") or ""
+            gr = grupo or (g if g in ("Income", "COGS", "Expenses", "OtherIncome",
+                                      "OtherExpenses") else "")
+            filhos = (r.get("Rows") or {}).get("Row")
+            if r.get("type") == "Data" and r.get("ColData"):
+                cd = r["ColData"]
+                contas.append((gr, cd[0].get("value") or "",
+                               [num(cd[i].get("value")) if i < len(cd) else 0.0
+                                for i in range(n)]))
+            if filhos:
+                varre(filhos, gr)
+            # conta-mãe com valor próprio: vem no Header da seção
+            if filhos and r.get("Header") and gr:
+                cd = (r.get("Header") or {}).get("ColData") or []
+                vals = [num(cd[i].get("value")) if i < len(cd) else 0.0 for i in range(n)]
+                if any(vals[1:]):
+                    contas.append((gr, (cd[0].get("value") if cd else "") or "", vals))
+    varre((rel.get("Rows") or {}).get("Row") or [], "")
+
+    nomes_custo = sorted({c[1] for c in contas if c[0] in ("COGS", "Expenses", "OtherExpenses")})
+    projetos = []
+    for i in range(1, n):
+        t = titulos[i]
+        if not t or t.lower() == "total":
+            continue
+        receita = sum(c[2][i] for c in contas if c[0] in ("Income", "OtherIncome"))
+        custos = {}
+        for g, nome, vals in contas:
+            if g in ("COGS", "Expenses", "OtherExpenses") and vals[i]:
+                custos[nome] = round(custos.get(nome, 0.0) + vals[i], 2)
+        if not receita and not custos:
+            continue
+        projetos.append({"projeto": t, "id": ids[i], "receita": round(receita, 2),
+                         "custos": custos})
+    return {"projetos": projetos, "contas_custo": nomes_custo}
+
+
+@app.get("/fin/obras")
+def fin_obras(authorization: str = Header(default=""), forcar: int = 0):
+    """Custo e lucro de cada projeto por conta, para o painel de obras."""
+    so_financeiro(authorization)
+    agora = time.time()
+    if forcar or not _obras_cache["dados"] or agora - _obras_cache["t"] > 600:
+        _obras_cache.update(t=agora, dados=qb_custos_por_projeto())
+    return {"ok": True, **_obras_cache["dados"],
+            "atualizado": _dt.utcfromtimestamp(_obras_cache["t"]).isoformat() + "Z"}
+
+
+@app.get("/jn/notas")
+def jn_notas(authorization: str = Header(default=""), q: str = "", size: int = 100):
+    """Notas recentes do JobNimbus (para achar o formato da previsão da Luisa).
+
+    q: só devolve notas que contenham esse texto (sem diferenciar maiúsculas).
+    """
+    quem_e(authorization)
+    flt = json.dumps({"must": [{"term": {"record_type_name": "Note"}}]})
+    r = requests.get(f"{JN_BASE}/activities", headers=jn_headers(),
+                     params={"filter": flt, "size": max(1, min(int(size), 500)),
+                             "sort_field": "date_created", "sort_direction": "desc"},
+                     timeout=60)
+    if not r.ok:
+        raise HTTPException(502, f"JobNimbus falhou ({r.status_code}): {r.text[:200]}")
+    saida = []
+    for a in (r.json() or {}).get("activity") or (r.json() or {}).get("results") or []:
+        txt = str(a.get("note") or "")
+        if q and q.lower() not in txt.lower():
+            continue
+        prim = a.get("primary") or {}
+        saida.append({"data": a.get("date_created"), "por": a.get("created_by_name"),
+                      "job": prim.get("name") or "", "job_id": prim.get("id") or "",
+                      "tipo": prim.get("type") or "", "nota": txt[:2000]})
+    return {"ok": True, "qtd": len(saida), "notas": saida}
+
+
 @app.get("/qb/margens")
 def qb_margens_rota(authorization: str = Header(default="")):
     quem_e(authorization)
@@ -2906,6 +3012,59 @@ def fin_pl(authorization: str = Header(default="")):
     so_financeiro(authorization)
     return {"ok": True, "cash": qb_pl_mes("Cash"), "accrual": qb_pl_mes("Accrual"),
             "usado": FIN_PL_METODO}
+
+
+@app.get("/fin/pl/receita")
+def fin_pl_receita(ini: str = "", fim: str = "", authorization: str = Header(default="")):
+    """Para conferir a Entrada da Performance: cada lançamento das contas de
+    receita (regime de caixa), com tipo, data, cliente e valor.
+
+    Separa o que veio de pagamento de fatura do resto (sales receipt,
+    depósito direto, journal entry...), que é o que a planilha não enxerga.
+    """
+    so_financeiro(authorization)
+    hoje = _hoje_ny()
+    ini = ini or hoje.replace(day=1).isoformat()
+    fim = fim or hoje.isoformat()
+    rel = qb_get("reports/ProfitAndLossDetail",
+                 {"start_date": ini, "end_date": fim, "accounting_method": "Cash",
+                  "columns": "tx_date,txn_type,doc_num,name,memo,account_name,subt_nat_amount"})
+    cols = [c.get("ColTitle") or c.get("ColType") or "" for c in
+            ((rel.get("Columns") or {}).get("Column") or [])]
+    linhas = []
+
+    def varre(rows, secao):
+        for r in (rows or []):
+            titulo = ((r.get("Header") or {}).get("ColData") or [{}])[0].get("value") or ""
+            grupo = r.get("group") or ""
+            sec = secao or (grupo if grupo in ("Income", "COGS", "Expenses",
+                                               "OtherIncome", "OtherExpenses") else "")
+            if r.get("type") == "Data" or (r.get("ColData") and not r.get("Rows")):
+                vals = [c.get("value") or "" for c in (r.get("ColData") or [])]
+                d = dict(zip(cols, vals))
+                d["_secao"] = secao
+                linhas.append(d)
+            filhos = (r.get("Rows") or {}).get("Row")
+            if filhos:
+                varre(filhos, sec or (titulo if grupo == "" else ""))
+    varre((rel.get("Rows") or {}).get("Row") or [], "")
+
+    def num(v):
+        try:
+            return float(str(v).replace(",", ""))
+        except ValueError:
+            return 0.0
+    receita = [l for l in linhas if l.get("_secao") == "Income"]
+    vk = next((c for c in cols if "amount" in c.lower()), cols[-1] if cols else "")
+    tk = next((c for c in cols if "type" in c.lower()), "")
+    por_tipo = {}
+    for l in receita:
+        t = l.get(tk) or "?"
+        por_tipo[t] = round(por_tipo.get(t, 0.0) + num(l.get(vk)), 2)
+    fora = [l for l in receita if (l.get(tk) or "") not in ("Invoice", "Payment")]
+    return {"ok": True, "ini": ini, "fim": fim, "colunas": cols,
+            "total": round(sum(num(l.get(vk)) for l in receita), 2),
+            "por_tipo": por_tipo, "fora_de_fatura": fora, "qtd": len(receita)}
 
 
 # ---------------------------------------------------------- QuickBooks: contas a pagar e saldo
