@@ -2436,6 +2436,17 @@ def _corta_padrao(texto):
     return t.split("for your convenience")[0]
 
 
+def _rotulo_nota(nota):
+    """O tipo que o card do app mostra: o 2º pedaço da nota, entre vírgulas.
+
+    A nota vem como "Estimate #4594, Middle Payment, ...". O resto da nota
+    pode citar outro tipo ("...after down payment") — foi assim que a
+    #4789 da Ellen Seely, Middle no card, saiu como down payment.
+    """
+    partes = (nota or "").lower().split(",")
+    return partes[1].strip() if len(partes) > 1 else ""
+
+
 def _textos_tipo(inv):
     """Textos da fatura na ordem em que decidem o tipo.
 
@@ -2454,10 +2465,11 @@ def _textos_tipo(inv):
         linhas.append(str(ln.get("Description") or ""))
         det = ln.get("SalesItemLineDetail") or {}
         linhas.append(str((det.get("ItemRef") or {}).get("name") or ""))
-    return [nota, msg, _corta_padrao(" | ".join(p for p in linhas if p))]
+    return [_rotulo_nota(nota), nota, msg,
+            _corta_padrao(" | ".join(p for p in linhas if p))]
 
 
-def _eh_full(memo):
+def _eh_full(memo, rotulo=""):
     """Full payment de verdade: "full" na DESCRIÇÃO da fatura.
 
     O memo do cliente traz depois o bloco padrão "payment options: ..."
@@ -2465,6 +2477,12 @@ def _eh_full(memo):
     toda fatura como full e derrubou o recebido dos PMs. Agora só vale o
     trecho antes de "payment options".
     """
+    rot = _rotulo_nota(rotulo)
+    if rot:
+        if _re.search(r"full\s*payment|100\s*%[^|]{0,40}payment", rot):
+            return True
+        if _re.search(r"middle|final|down|deposit", rot):
+            return False
     m = (memo or "").lower().split("payment option")[0]
     m = m.split("for your convenience")[0]      # texto padrão antigo
     # Fatura de middle/final que cita "in full" em outra frase não é full
@@ -2486,7 +2504,7 @@ def qb_faturas_por_id(ids):
     """Busca faturas pelo Id, em lotes, guardando o que já foi lido."""
     # "full" entrou depois: entrada antiga no cache sem essa chave é relida
     faltam = [i for i in ids if i and (i not in _inv_cache
-              or (_inv_cache[i].get("fv") != 6
+              or (_inv_cache[i].get("fv") != 7
                   and not _inv_cache[i].get("desconhecida")))]
     for k in range(0, len(faltam), 40):
         lote = faltam[k:k + 40]
@@ -2504,7 +2522,7 @@ def qb_faturas_por_id(ids):
                 "entrada": _classifica(*_textos_tipo(inv)),
                 # Full payment: o app conta metade para o PM quando o
                 # pagamento entra depois de a obra começar (extras)
-                "full": _eh_full(memo), "fv": 6,
+                "full": _eh_full(memo, inv.get("PrivateNote") or ""), "fv": 7,
                 "doc": inv.get("DocNumber") or "",
                 # Projeto DA FATURA. A baixa às vezes é lançada no cliente
                 # principal ("Ellen Seely") e não no projeto ("Ellen
@@ -2550,7 +2568,7 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
     total do PM, mesmo quando divididas em várias parcelas — a decisão
     é tomada na FATURA, então todas as partes dela caem junto.
     """
-    chave = "v7:" + str(ini) + ".." + str(fim)      # v5: full só pela descrição
+    chave = "v8:" + str(ini) + ".." + str(fim)      # v5: full só pela descrição
     guardado = _rec_cache.get(chave)
     if guardado and (time.time() - guardado["quando"]) < 600 and not detalhado:
         return guardado["dados"]
