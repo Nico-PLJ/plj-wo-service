@@ -2486,7 +2486,7 @@ def qb_faturas_por_id(ids):
     """Busca faturas pelo Id, em lotes, guardando o que já foi lido."""
     # "full" entrou depois: entrada antiga no cache sem essa chave é relida
     faltam = [i for i in ids if i and (i not in _inv_cache
-              or (_inv_cache[i].get("fv") != 5
+              or (_inv_cache[i].get("fv") != 6
                   and not _inv_cache[i].get("desconhecida")))]
     for k in range(0, len(faltam), 40):
         lote = faltam[k:k + 40]
@@ -2504,8 +2504,14 @@ def qb_faturas_por_id(ids):
                 "entrada": _classifica(*_textos_tipo(inv)),
                 # Full payment: o app conta metade para o PM quando o
                 # pagamento entra depois de a obra começar (extras)
-                "full": _eh_full(memo), "fv": 5,
+                "full": _eh_full(memo), "fv": 6,
                 "doc": inv.get("DocNumber") or "",
+                # Projeto DA FATURA. A baixa às vezes é lançada no cliente
+                # principal ("Ellen Seely") e não no projeto ("Ellen
+                # Seely:(Rob) Decking - 170 Zoheth..."): sem o endereço o
+                # app não acha o card e o dinheiro não ia para o PM.
+                "cli": (inv.get("CustomerRef") or {}).get("name") or "",
+                "cliid": (inv.get("CustomerRef") or {}).get("value") or "",
             }
         # Fatura que o QuickBooks não devolveu fica marcada como
         # DESCONHECIDA — e desconhecida não é o mesmo que "não é
@@ -2544,7 +2550,7 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
     total do PM, mesmo quando divididas em várias parcelas — a decisão
     é tomada na FATURA, então todas as partes dela caem junto.
     """
-    chave = "v6:" + str(ini) + ".." + str(fim)      # v5: full só pela descrição
+    chave = "v7:" + str(ini) + ".." + str(fim)      # v5: full só pela descrição
     guardado = _rec_cache.get(chave)
     if guardado and (time.time() - guardado["quando"]) < 600 and not detalhado:
         return guardado["dados"]
@@ -2575,11 +2581,12 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
         nome = ref.get("name") or ""
         if not nome:
             continue
-        d = por.setdefault(nome, {"projeto": nome,
-                                  "id": ref.get("value") or "",
-                                  "recebido": 0.0, "qtd": 0,
-                                  "entrada": 0.0, "semfatura": 0.0,
-                                  "desconhecido": 0.0, "fulls": []})
+        def _proj(n, i):
+            return por.setdefault(n, {"projeto": n, "id": i or "",
+                                      "recebido": 0.0, "qtd": 0,
+                                      "entrada": 0.0, "semfatura": 0.0,
+                                      "desconhecido": 0.0, "fulls": []})
+        d_pag = _proj(nome, ref.get("value"))
         partes = _linhas_do_pagamento(p)
         # Adiantamento sem fatura amarrada: entrou no caixa mas não
         # abateu nada. Nunca contou e continua não contando.
@@ -2588,6 +2595,10 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
             continue
         for fid, val in partes:
             inf = _inv_cache.get(fid) or {}
+            # Cada parte vai para o projeto da fatura que ela pagou.
+            nproj = inf.get("cli") or nome
+            d = _proj(nproj, inf.get("cliid") or ref.get("value")) \
+                if nproj != nome else d_pag
             if not fid:
                 # parte sem fatura ligada: é adiantamento solto
                 d["semfatura"] += val
@@ -2614,7 +2625,7 @@ def qb_recebido_periodo(ini, fim, detalhado=False):
                                    "contou": classe == "conta"})
             if detalhado:
                 linhas.append({
-                    "projeto": nome,
+                    "projeto": nproj,
                     "data": p.get("TxnDate") or "",
                     "pagamento": p.get("Id") or "",
                     "fatura": inf.get("doc") or fid,
