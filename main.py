@@ -2402,7 +2402,7 @@ def _texto_fatura(inv):
     return memo, inteiro
 
 
-def _classifica(memo, inteiro):
+def _classifica(*textos):
     """Entrada não conta para o PM; middle, final e full contam.
 
     A ORDEM é a mesma do tipoFatura() do app: "down" ganha de
@@ -2415,7 +2415,7 @@ def _classifica(memo, inteiro):
     A decisão sai do MEMO quando ele disser algo, porque é o campo que o
     app mostra. As descrições das linhas são só reserva.
     """
-    for texto in (memo, inteiro):
+    for texto in textos:
         if not texto:
             continue
         if any(p in texto for p in PALAVRAS_DOWN):
@@ -2423,6 +2423,38 @@ def _classifica(memo, inteiro):
         if any(p in texto for p in PALAVRAS_CONTA):
             return False
     return False
+
+
+def _corta_padrao(texto):
+    """Tira o bloco padrão de formas de pagamento do texto da fatura.
+
+    A mensagem para o cliente traz depois "payment options: ..." (ou o
+    antigo "for your convenience..."), que fala em "deposit", "in full"
+    etc. e não diz nada sobre o tipo DESTA fatura.
+    """
+    t = (texto or "").lower().split("payment option")[0]
+    return t.split("for your convenience")[0]
+
+
+def _textos_tipo(inv):
+    """Textos da fatura na ordem em que decidem o tipo.
+
+    1º a nota da fatura (PrivateNote) — é o que o card do app mostra
+       ("Middle Payment", "Down Payment"...);
+    2º a mensagem para o cliente, sem o bloco padrão de pagamento;
+    3º as descrições das linhas.
+    Antes o recebido juntava nota + mensagem e "down" em qualquer lugar
+    ganhava: a #4789 (Ellen Seely) aparecia como Middle no card e saía do
+    total do PM como se fosse down payment.
+    """
+    nota = str(inv.get("PrivateNote") or "").lower()
+    msg = _corta_padrao((inv.get("CustomerMemo") or {}).get("value") or "")
+    linhas = []
+    for ln in (inv.get("Line") or []):
+        linhas.append(str(ln.get("Description") or ""))
+        det = ln.get("SalesItemLineDetail") or {}
+        linhas.append(str((det.get("ItemRef") or {}).get("name") or ""))
+    return [nota, msg, _corta_padrao(" | ".join(p for p in linhas if p))]
 
 
 def _eh_full(memo):
@@ -2451,7 +2483,7 @@ def qb_faturas_por_id(ids):
     """Busca faturas pelo Id, em lotes, guardando o que já foi lido."""
     # "full" entrou depois: entrada antiga no cache sem essa chave é relida
     faltam = [i for i in ids if i and (i not in _inv_cache
-              or (_inv_cache[i].get("fv") != 3
+              or (_inv_cache[i].get("fv") != 4
                   and not _inv_cache[i].get("desconhecida")))]
     for k in range(0, len(faltam), 40):
         lote = faltam[k:k + 40]
@@ -2466,10 +2498,10 @@ def qb_faturas_por_id(ids):
             memo, inteiro = _texto_fatura(inv)
             _inv_cache[str(inv.get("Id"))] = {
                 "texto": (memo or inteiro),
-                "entrada": _classifica(memo, inteiro),
+                "entrada": _classifica(*_textos_tipo(inv)),
                 # Full payment: o app conta metade para o PM quando o
                 # pagamento entra depois de a obra começar (extras)
-                "full": _eh_full(memo), "fv": 3,
+                "full": _eh_full(memo), "fv": 4,
                 "doc": inv.get("DocNumber") or "",
             }
         # Fatura que o QuickBooks não devolveu fica marcada como
