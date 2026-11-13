@@ -2471,7 +2471,10 @@ def _eh_full(memo):
     # payment (ex.: #4668, #4801, #4813 entravam pela metade).
     if _re.search(r"middle|final", m):
         return False
-    return bool(_re.search(r"full\s*payment", m))
+    # "100% Start Date Payment" também é full payment: sem isto a fatura
+    # da Theresa Wall (US$ 10.300) entrava inteira para o Herique.
+    return bool(_re.search(r"full\s*payment", m)
+                or _re.search(r"100\s*%[^|]{0,40}payment", m))
 
 
 def _eh_entrada(texto):
@@ -2483,7 +2486,7 @@ def qb_faturas_por_id(ids):
     """Busca faturas pelo Id, em lotes, guardando o que já foi lido."""
     # "full" entrou depois: entrada antiga no cache sem essa chave é relida
     faltam = [i for i in ids if i and (i not in _inv_cache
-              or (_inv_cache[i].get("fv") != 4
+              or (_inv_cache[i].get("fv") != 5
                   and not _inv_cache[i].get("desconhecida")))]
     for k in range(0, len(faltam), 40):
         lote = faltam[k:k + 40]
@@ -2501,7 +2504,7 @@ def qb_faturas_por_id(ids):
                 "entrada": _classifica(*_textos_tipo(inv)),
                 # Full payment: o app conta metade para o PM quando o
                 # pagamento entra depois de a obra começar (extras)
-                "full": _eh_full(memo), "fv": 4,
+                "full": _eh_full(memo), "fv": 5,
                 "doc": inv.get("DocNumber") or "",
             }
         # Fatura que o QuickBooks não devolveu fica marcada como
